@@ -71,12 +71,46 @@ fn bool_bool(self: *PyObject) bool {
     return self.as(PyBoolObject).value;
 }
 
+fn makeSmallIntCache() [262]PyIntObject {
+    var cache: [262]PyIntObject = undefined;
+    var i: i64 = -5;
+    while (i <= 256) : (i += 1) {
+        const idx = @as(usize, @intCast(i + 5));
+        cache[idx] = .{
+            .base = .{
+                .refcnt = 999999,
+                .type_obj = &PyInt_Type,
+            },
+            .value = i,
+        };
+    }
+    return cache;
+}
+
+pub var small_int_cache = makeSmallIntCache();
+
 // --- Int Type ---
 pub const PyIntObject = extern struct {
     base: PyObject,
     value: i64,
 
     pub fn create(value: i64, mm: *PyMemoryManager) !*PyObject {
+        if (value >= -5 and value <= 256) {
+            const idx = @as(usize, @intCast(value + 5));
+            return &small_int_cache[idx].base;
+        }
+
+        if (mm.int_free_list) |node| {
+            mm.int_free_list = @as(*?*anyopaque, @ptrCast(@alignCast(node))).*;
+            const obj = @as(*PyIntObject, @ptrCast(@alignCast(node)));
+            mm.object_count += 1;
+            obj.* = .{
+                .base = PyObject.init(&PyInt_Type),
+                .value = value,
+            };
+            return &obj.base;
+        }
+
         const obj = try mm.alloc(PyIntObject);
         obj.* = .{
             .base = PyObject.init(&PyInt_Type),
@@ -106,7 +140,13 @@ fn int_hash(self: *PyObject) anyerror!i64 {
 
 fn int_dealloc(self: *PyObject, mm: *PyMemoryManager) void {
     const obj = self.as(PyIntObject);
-    mm.free(PyIntObject, obj);
+    if (obj.value >= -5 and obj.value <= 256) {
+        return;
+    }
+    const node = @as(*anyopaque, @ptrCast(obj));
+    @as(*?*anyopaque, @ptrCast(@alignCast(node))).* = mm.int_free_list;
+    mm.int_free_list = node;
+    mm.object_count -= 1;
 }
 
 fn int_repr(self: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
@@ -198,6 +238,17 @@ pub const PyFloatObject = extern struct {
     value: f64,
 
     pub fn create(value: f64, mm: *PyMemoryManager) !*PyObject {
+        if (mm.float_free_list) |node| {
+            mm.float_free_list = @as(*?*anyopaque, @ptrCast(@alignCast(node))).*;
+            const obj = @as(*PyFloatObject, @ptrCast(@alignCast(node)));
+            mm.object_count += 1;
+            obj.* = .{
+                .base = PyObject.init(&PyFloat_Type),
+                .value = value,
+            };
+            return &obj.base;
+        }
+
         const obj = try mm.alloc(PyFloatObject);
         obj.* = .{
             .base = PyObject.init(&PyFloat_Type),
@@ -222,7 +273,10 @@ pub const PyFloat_Type = PyTypeObject{
 
 fn float_dealloc(self: *PyObject, mm: *PyMemoryManager) void {
     const obj = self.as(PyFloatObject);
-    mm.free(PyFloatObject, obj);
+    const node = @as(*anyopaque, @ptrCast(obj));
+    @as(*?*anyopaque, @ptrCast(@alignCast(node))).* = mm.float_free_list;
+    mm.float_free_list = node;
+    mm.object_count -= 1;
 }
 
 fn float_repr(self: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
@@ -415,6 +469,7 @@ fn string_richcompare(self: *PyObject, other: *PyObject, op: CompareOp, mm: *PyM
 test "primitives creation and arithmetic" {
     const allocator = std.testing.allocator;
     var mm = PyMemoryManager.init(allocator);
+    defer mm.deinit();
 
     const int1 = try PyIntObject.create(10, &mm);
     defer int1.decRef(&mm);

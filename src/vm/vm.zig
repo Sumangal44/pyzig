@@ -56,6 +56,7 @@ pub const PyFrameObject = struct {
     locals: std.StringHashMap(*PyObject),
     globals: *std.StringHashMap(*PyObject),
     is_module: bool,
+    fastlocals: []?*PyObject = &[_]?*PyObject{},
     
     // Exception blocks and class/method fields
     block_stack: [16]Block = undefined,
@@ -68,11 +69,17 @@ pub const PyFrameObject = struct {
     active_exception: ?*PyObject = null,
 
     pub fn init(allocator: std.mem.Allocator, code: *PyCodeObject, globals: *std.StringHashMap(*PyObject), is_module: bool) PyFrameObject {
+        var fastlocals: []?*PyObject = &[_]?*PyObject{};
+        if (code.varnames.len > 0) {
+            fastlocals = allocator.alloc(?*PyObject, code.varnames.len) catch @panic("OOM");
+            @memset(fastlocals, null);
+        }
         return .{
             .code = code,
             .locals = std.StringHashMap(*PyObject).init(allocator),
             .globals = globals,
             .is_module = is_module,
+            .fastlocals = fastlocals,
         };
     }
 
@@ -83,6 +90,12 @@ pub const PyFrameObject = struct {
             entry.value_ptr.*.decRef(mm);
         }
         self.locals.deinit();
+        for (self.fastlocals) |opt_val| {
+            if (opt_val) |val| val.decRef(mm);
+        }
+        if (self.fastlocals.len > 0) {
+            allocator.free(self.fastlocals);
+        }
         while (self.stack_top > 0) {
             self.stack_top -= 1;
             self.stack[self.stack_top].decRef(mm);
@@ -94,17 +107,21 @@ pub const PyFrameObject = struct {
         if (self.active_exception) |ae| ae.decRef(mm);
     }
 
-    pub fn push(self: *PyFrameObject, obj: *PyObject) void {
-        if (self.stack_top >= 256) {
-            @panic("Stack overflow");
+    pub inline fn push(self: *PyFrameObject, obj: *PyObject) void {
+        if (std.debug.runtime_safety) {
+            if (self.stack_top >= 256) {
+                @panic("Stack overflow");
+            }
         }
         self.stack[self.stack_top] = obj;
         self.stack_top += 1;
     }
 
-    pub fn pop(self: *PyFrameObject) *PyObject {
-        if (self.stack_top == 0) {
-            @panic("Stack underflow");
+    pub inline fn pop(self: *PyFrameObject) *PyObject {
+        if (std.debug.runtime_safety) {
+            if (self.stack_top == 0) {
+                @panic("Stack underflow");
+            }
         }
         self.stack_top -= 1;
         return self.stack[self.stack_top];
@@ -114,14 +131,20 @@ pub const PyFrameObject = struct {
 fn isTrue(obj: *PyObject) bool {
     if (obj == PyTrue) return true;
     if (obj == PyFalse or obj == PyNone) return false;
-    if (std.mem.eql(u8, obj.type_obj.name, "list")) {
+    if (obj.type_obj == &PyList_Type) {
         return obj.as(PyListObject).size > 0;
     }
-    if (std.mem.eql(u8, obj.type_obj.name, "tuple")) {
+    if (obj.type_obj == &PyTuple_Type) {
         return obj.as(PyTupleObject).size > 0;
     }
-    if (std.mem.eql(u8, obj.type_obj.name, "dict")) {
+    if (obj.type_obj == &PyDict_Type) {
         return obj.as(PyDictObject).active_count > 0;
+    }
+    if (obj.type_obj == &primitives.PyInt_Type) {
+        return obj.as(primitives.PyIntObject).value != 0;
+    }
+    if (obj.type_obj == &primitives.PyFloat_Type) {
+        return obj.as(primitives.PyFloatObject).value != 0.0;
     }
     if (obj.type_obj.tp_bool) |bool_fn| {
         return bool_fn(obj);
@@ -423,24 +446,15 @@ pub const VM = struct {
                 return error.StackOverflow;
             }
             
-            var child_frame = PyFrameObject{
-                .code = func_code,
-                .ip = 0,
-                .stack_top = 0,
-                .locals = std.StringHashMap(*PyObject).init(self.allocator),
-                .globals = func.globals,
-                .is_module = false,
-                .func = func,
-                .init_instance = init_instance,
-            };
+            var child_frame = PyFrameObject.init(self.allocator, func_code, func.globals, false);
+            child_frame.func = func;
+            child_frame.init_instance = init_instance;
             func.base.incRef();
             if (init_instance) |ii| ii.incRef();
             errdefer child_frame.deinit(self.mm, self.allocator);
             
             for (args, 0..) |arg_val, arg_idx| {
-                const param_name = func_code.varnames[arg_idx];
-                const param_name_copy = try self.allocator.dupe(u8, param_name);
-                try child_frame.locals.put(param_name_copy, arg_val);
+                child_frame.fastlocals[arg_idx] = arg_val;
             }
             
             self.frames[self.frame_count] = child_frame;
@@ -611,41 +625,68 @@ pub const VM = struct {
                 },
                 .BINARY_ADD => {
                     const b = f.pop();
-                    defer b.decRef(self.mm);
                     const a = f.pop();
-                    defer a.decRef(self.mm);
 
-                    if (a.type_obj.tp_add) |add_fn| {
-                        const res = try add_fn(a, b, self.mm);
+                    if (a.type_obj == &primitives.PyInt_Type and b.type_obj == &primitives.PyInt_Type) {
+                        const val_a = a.as(primitives.PyIntObject).value;
+                        const val_b = b.as(primitives.PyIntObject).value;
+                        const res = try primitives.PyIntObject.create(val_a + val_b, self.mm);
+                        a.decRef(self.mm);
+                        b.decRef(self.mm);
                         f.push(res);
                     } else {
-                        return error.TypeError;
+                        defer a.decRef(self.mm);
+                        defer b.decRef(self.mm);
+                        if (a.type_obj.tp_add) |add_fn| {
+                            const res = try add_fn(a, b, self.mm);
+                            f.push(res);
+                        } else {
+                            return error.TypeError;
+                        }
                     }
                 },
                 .BINARY_SUB => {
                     const b = f.pop();
-                    defer b.decRef(self.mm);
                     const a = f.pop();
-                    defer a.decRef(self.mm);
 
-                    if (a.type_obj.tp_sub) |sub_fn| {
-                        const res = try sub_fn(a, b, self.mm);
+                    if (a.type_obj == &primitives.PyInt_Type and b.type_obj == &primitives.PyInt_Type) {
+                        const val_a = a.as(primitives.PyIntObject).value;
+                        const val_b = b.as(primitives.PyIntObject).value;
+                        const res = try primitives.PyIntObject.create(val_a - val_b, self.mm);
+                        a.decRef(self.mm);
+                        b.decRef(self.mm);
                         f.push(res);
                     } else {
-                        return error.TypeError;
+                        defer a.decRef(self.mm);
+                        defer b.decRef(self.mm);
+                        if (a.type_obj.tp_sub) |sub_fn| {
+                            const res = try sub_fn(a, b, self.mm);
+                            f.push(res);
+                        } else {
+                            return error.TypeError;
+                        }
                     }
                 },
                 .BINARY_MUL => {
                     const b = f.pop();
-                    defer b.decRef(self.mm);
                     const a = f.pop();
-                    defer a.decRef(self.mm);
 
-                    if (a.type_obj.tp_mul) |mul_fn| {
-                        const res = try mul_fn(a, b, self.mm);
+                    if (a.type_obj == &primitives.PyInt_Type and b.type_obj == &primitives.PyInt_Type) {
+                        const val_a = a.as(primitives.PyIntObject).value;
+                        const val_b = b.as(primitives.PyIntObject).value;
+                        const res = try primitives.PyIntObject.create(val_a * val_b, self.mm);
+                        a.decRef(self.mm);
+                        b.decRef(self.mm);
                         f.push(res);
                     } else {
-                        return error.TypeError;
+                        defer a.decRef(self.mm);
+                        defer b.decRef(self.mm);
+                        if (a.type_obj.tp_mul) |mul_fn| {
+                            const res = try mul_fn(a, b, self.mm);
+                            f.push(res);
+                        } else {
+                            return error.TypeError;
+                        }
                     }
                 },
                 .BINARY_DIV => {
@@ -663,15 +704,34 @@ pub const VM = struct {
                 },
                 .COMPARE_OP => {
                     const b = f.pop();
-                    defer b.decRef(self.mm);
                     const a = f.pop();
-                    defer a.decRef(self.mm);
 
-                    if (a.type_obj.tp_richcompare) |cmp_fn| {
-                        const res = try cmp_fn(a, b, @enumFromInt(instr.arg), self.mm);
+                    if (a.type_obj == &primitives.PyInt_Type and b.type_obj == &primitives.PyInt_Type) {
+                        const val_a = a.as(primitives.PyIntObject).value;
+                        const val_b = b.as(primitives.PyIntObject).value;
+                        const op: CompareOp = @enumFromInt(instr.arg);
+                        const match = switch (op) {
+                            .Lt => val_a < val_b,
+                            .Le => val_a <= val_b,
+                            .Eq => val_a == val_b,
+                            .Ne => val_a != val_b,
+                            .Gt => val_a > val_b,
+                            .Ge => val_a >= val_b,
+                        };
+                        const res = if (match) PyTrue else PyFalse;
+                        res.incRef();
+                        a.decRef(self.mm);
+                        b.decRef(self.mm);
                         f.push(res);
                     } else {
-                        return error.TypeError;
+                        defer a.decRef(self.mm);
+                        defer b.decRef(self.mm);
+                        if (a.type_obj.tp_richcompare) |cmp_fn| {
+                            const res = try cmp_fn(a, b, @enumFromInt(instr.arg), self.mm);
+                            f.push(res);
+                        } else {
+                            return error.TypeError;
+                        }
                     }
                 },
                 .PRINT_EXPR => {
@@ -1013,6 +1073,25 @@ pub const VM = struct {
                     res.incRef();
                     f.push(res);
                 },
+                .LOAD_FAST => {
+                    const idx = instr.arg;
+                    if (f.fastlocals[idx]) |val| {
+                        val.incRef();
+                        f.push(val);
+                    } else {
+                        const name = f.code.varnames[idx];
+                        std.debug.print("NameError: local variable '{s}' referenced before assignment\n", .{name});
+                        return error.NameError;
+                    }
+                },
+                .STORE_FAST => {
+                    const val = f.pop();
+                    const idx = instr.arg;
+                    if (f.fastlocals[idx]) |old_val| {
+                        old_val.decRef(self.mm);
+                    }
+                    f.fastlocals[idx] = val;
+                },
             }
         }
 
@@ -1024,6 +1103,7 @@ pub const VM = struct {
 test "VM execution of simple arithmetic" {
     const allocator = testing.allocator;
     var mm = PyMemoryManager.init(allocator);
+    defer mm.deinit();
 
     // Dynamic output capture for test
     var alloc_writer = std.Io.Writer.Allocating.init(allocator);
@@ -1093,6 +1173,7 @@ test "VM integration test - control flow and collections" {
 
     const allocator = testing.allocator;
     var mm = PyMemoryManager.init(allocator);
+    defer mm.deinit();
 
     var alloc_writer = std.Io.Writer.Allocating.init(allocator);
     defer alloc_writer.deinit();
@@ -1151,6 +1232,7 @@ test "VM integration test - recursive function" {
 
     const allocator = testing.allocator;
     var mm = PyMemoryManager.init(allocator);
+    defer mm.deinit();
 
     var alloc_writer = std.Io.Writer.Allocating.init(allocator);
     defer alloc_writer.deinit();

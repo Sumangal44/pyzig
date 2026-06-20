@@ -50,6 +50,7 @@ pub fn main(init: std.process.Init) !void {
 
     var mm = PyMemoryManager.init(allocator);
     defer {
+        mm.deinit();
         if (mm.allocated_bytes > 0) {
             std.debug.print("[pyzig memory leak check] Warning: leaked {d} bytes, {d} objects!\n", .{mm.allocated_bytes, mm.object_count});
         }

@@ -30,6 +30,8 @@ pub const Compiler = struct {
     names: std.ArrayList([]const u8),
     nonlocals: std.StringHashMap(void),
     locals: std.StringHashMap(void),
+    varnames: std.ArrayList([]const u8),
+    is_function: bool = false,
     parent: ?*Compiler = null,
 
     pub fn init(allocator: std.mem.Allocator, mm: *PyMemoryManager) Compiler {
@@ -41,6 +43,8 @@ pub const Compiler = struct {
             .names = std.ArrayList([]const u8).empty,
             .nonlocals = std.StringHashMap(void).init(allocator),
             .locals = std.StringHashMap(void).init(allocator),
+            .varnames = std.ArrayList([]const u8).empty,
+            .is_function = false,
             .parent = null,
         };
     }
@@ -55,8 +59,49 @@ pub const Compiler = struct {
             self.allocator.free(name);
         }
         self.names.deinit(self.allocator);
+        for (self.varnames.items) |name| {
+            self.allocator.free(name);
+        }
+        self.varnames.deinit(self.allocator);
         self.nonlocals.deinit();
         self.locals.deinit();
+    }
+
+    fn addVarname(self: *Compiler, name: []const u8) !u16 {
+        for (self.varnames.items, 0..) |item, i| {
+            if (std.mem.eql(u8, item, name)) {
+                return @intCast(i);
+            }
+        }
+        const name_copy = try self.allocator.dupe(u8, name);
+        try self.varnames.append(self.allocator, name_copy);
+        return @intCast(self.varnames.items.len - 1);
+    }
+
+    fn emitStore(self: *Compiler, name: []const u8) anyerror!void {
+        if (self.nonlocals.contains(name) or try self.checkEnclosingScope(name)) {
+            const name_idx = try self.addName(name);
+            try self.instructions.append(self.allocator, .{ .op = .STORE_DEREF, .arg = name_idx });
+        } else if (self.is_function and self.locals.contains(name)) {
+            const var_idx = try self.addVarname(name);
+            try self.instructions.append(self.allocator, .{ .op = .STORE_FAST, .arg = var_idx });
+        } else {
+            const name_idx = try self.addName(name);
+            try self.instructions.append(self.allocator, .{ .op = .STORE_NAME, .arg = name_idx });
+        }
+    }
+
+    fn emitLoad(self: *Compiler, name: []const u8) anyerror!void {
+        if (self.nonlocals.contains(name) or try self.checkEnclosingScope(name)) {
+            const name_idx = try self.addName(name);
+            try self.instructions.append(self.allocator, .{ .op = .LOAD_DEREF, .arg = name_idx });
+        } else if (self.is_function and self.locals.contains(name)) {
+            const var_idx = try self.addVarname(name);
+            try self.instructions.append(self.allocator, .{ .op = .LOAD_FAST, .arg = var_idx });
+        } else {
+            const name_idx = try self.addName(name);
+            try self.instructions.append(self.allocator, .{ .op = .LOAD_NAME, .arg = name_idx });
+        }
     }
 
     fn addConst(self: *Compiler, obj: *PyObject) !u16 {
@@ -147,6 +192,7 @@ pub const Compiler = struct {
                         temp = t.parent;
                     } else break;
                 }
+                try c.nonlocals.put(name, {});
                 return true;
             }
             curr = c.parent;
@@ -163,12 +209,7 @@ pub const Compiler = struct {
             },
             .Assign => |assign| {
                 try self.compileAST(assign.value);
-                const name_idx = try self.addName(assign.target);
-                if (self.nonlocals.contains(assign.target) or try self.checkEnclosingScope(assign.target)) {
-                    try self.instructions.append(self.allocator, .{ .op = .STORE_DEREF, .arg = name_idx });
-                } else {
-                    try self.instructions.append(self.allocator, .{ .op = .STORE_NAME, .arg = name_idx });
-                }
+                try self.emitStore(assign.target);
             },
             .BinOp => |binop| {
                 try self.compileAST(binop.left);
@@ -205,12 +246,7 @@ pub const Compiler = struct {
                 try self.instructions.append(self.allocator, .{ .op = .LOAD_CONST, .arg = const_idx });
             },
             .Name => |name| {
-                const name_idx = try self.addName(name);
-                if (self.nonlocals.contains(name) or try self.checkEnclosingScope(name)) {
-                    try self.instructions.append(self.allocator, .{ .op = .LOAD_DEREF, .arg = name_idx });
-                } else {
-                    try self.instructions.append(self.allocator, .{ .op = .LOAD_NAME, .arg = name_idx });
-                }
+                try self.emitLoad(name);
             },
             .Print => |p| {
                 try self.compileAST(p.value);
@@ -266,25 +302,22 @@ pub const Compiler = struct {
                 try self.instructions.append(self.allocator, .{ .op = .BUILD_MAP, .arg = @intCast(dict_node.keys.len) });
             },
             .FunctionDef => |func_def| {
-                var child_varnames = try self.mm.allocator.alloc([]const u8, func_def.args.len);
-                errdefer {
-                    for (child_varnames) |name| self.mm.allocator.free(name);
-                    self.mm.allocator.free(child_varnames);
-                }
-                for (func_def.args, 0..) |arg_name, i| {
-                    child_varnames[i] = try self.mm.allocator.dupe(u8, arg_name);
-                }
-                
                 var child_compiler = Compiler.init(self.mm.allocator, self.mm);
                 child_compiler.parent = self;
+                child_compiler.is_function = true;
                 defer child_compiler.deinit();
                 
-                // Add args to child compiler's locals
+                // Add args to child compiler's varnames and locals
                 for (func_def.args) |arg| {
+                    try child_compiler.varnames.append(child_compiler.allocator, try child_compiler.allocator.dupe(u8, arg));
                     try child_compiler.locals.put(arg, {});
                 }
+                
                 // Pre-scan locals in function body
                 try child_compiler.preScanLocals(func_def.body);
+                
+                // Resolve scopes recursively
+                try child_compiler.resolveFunctionScopes(func_def.body);
                 
                 for (func_def.body) |*stmt| {
                     try child_compiler.compileAST(stmt);
@@ -298,6 +331,16 @@ pub const Compiler = struct {
                 const code_obj = try self.mm.allocator.create(PyCodeObject);
                 errdefer self.mm.allocator.destroy(code_obj);
                 
+                // Move child_compiler.varnames to owned slice using mm.allocator (since PyCodeObject owns it)
+                var child_varnames = try self.mm.allocator.alloc([]const u8, child_compiler.varnames.items.len);
+                errdefer {
+                    for (child_varnames) |name| self.mm.allocator.free(name);
+                    self.mm.allocator.free(child_varnames);
+                }
+                for (child_compiler.varnames.items, 0..) |vname, i| {
+                    child_varnames[i] = try self.mm.allocator.dupe(u8, vname);
+                }
+                
                 code_obj.* = PyCodeObject{
                     .instructions = try child_compiler.instructions.toOwnedSlice(self.mm.allocator),
                     .consts = try child_compiler.consts.toOwnedSlice(self.mm.allocator),
@@ -310,12 +353,7 @@ pub const Compiler = struct {
                 const const_idx = try self.addConst(wrapper);
                 try self.instructions.append(self.allocator, .{ .op = .LOAD_CONST, .arg = const_idx });
                 try self.instructions.append(self.allocator, .{ .op = .MAKE_FUNCTION });
-                const func_name_idx = try self.addName(func_def.name);
-                if (self.nonlocals.contains(func_def.name) or try self.checkEnclosingScope(func_def.name)) {
-                    try self.instructions.append(self.allocator, .{ .op = .STORE_DEREF, .arg = func_name_idx });
-                } else {
-                    try self.instructions.append(self.allocator, .{ .op = .STORE_NAME, .arg = func_name_idx });
-                }
+                try self.emitStore(func_def.name);
             },
             .Return => |ret| {
                 if (ret.value) |val| {
@@ -375,15 +413,13 @@ pub const Compiler = struct {
                 
                 var argc: u16 = 2;
                 if (class_def.base) |base_name| {
-                    const base_idx = try self.addName(base_name);
-                    try self.instructions.append(self.allocator, .{ .op = .LOAD_NAME, .arg = base_idx });
+                    try self.emitLoad(base_name);
                     argc = 3;
                 }
                 
                 try self.instructions.append(self.allocator, .{ .op = .CALL, .arg = argc });
                 
-                const class_name_idx = try self.addName(class_def.name);
-                try self.instructions.append(self.allocator, .{ .op = .STORE_NAME, .arg = class_name_idx });
+                try self.emitStore(class_def.name);
             },
             .Attribute => |attr_node| {
                 try self.compileAST(attr_node.value);
@@ -504,7 +540,7 @@ pub const Compiler = struct {
                 for (import_node.names) |name| {
                     const name_idx = try self.addName(name);
                     try self.instructions.append(self.allocator, .{ .op = .IMPORT_NAME, .arg = name_idx });
-                    try self.instructions.append(self.allocator, .{ .op = .STORE_NAME, .arg = name_idx });
+                    try self.emitStore(name);
                 }
             },
             .ImportFrom => |import_from| {
@@ -513,10 +549,140 @@ pub const Compiler = struct {
                 for (import_from.names) |name| {
                     const name_idx = try self.addName(name);
                     try self.instructions.append(self.allocator, .{ .op = .IMPORT_FROM, .arg = name_idx });
-                    try self.instructions.append(self.allocator, .{ .op = .STORE_NAME, .arg = name_idx });
+                    try self.emitStore(name);
                 }
                 try self.instructions.append(self.allocator, .{ .op = .POP_TOP });
             },
+        }
+    }
+
+    fn resolveFunctionScopes(self: *Compiler, body: []const AST) anyerror!void {
+        for (body) |stmt| {
+            try self.resolveScopesAST(&stmt);
+        }
+    }
+
+    fn resolveScopesAST(self: *Compiler, node: *const AST) anyerror!void {
+        switch (node.*) {
+            .Module => |mod| {
+                for (mod.body) |*stmt| {
+                    try self.resolveScopesAST(stmt);
+                }
+            },
+            .Assign => |assign| {
+                try self.resolveScopesAST(assign.value);
+            },
+            .BinOp => |binop| {
+                try self.resolveScopesAST(binop.left);
+                try self.resolveScopesAST(binop.right);
+            },
+            .Compare => |cmp| {
+                try self.resolveScopesAST(cmp.left);
+                try self.resolveScopesAST(cmp.right);
+            },
+            .Constant => {},
+            .Name => |name| {
+                _ = try self.checkEnclosingScope(name);
+            },
+            .Print => |p| {
+                try self.resolveScopesAST(p.value);
+            },
+            .If => |if_node| {
+                try self.resolveScopesAST(if_node.cond);
+                for (if_node.body) |*stmt| {
+                    try self.resolveScopesAST(stmt);
+                }
+                for (if_node.orelse_body) |*stmt| {
+                    try self.resolveScopesAST(stmt);
+                }
+            },
+            .While => |while_node| {
+                try self.resolveScopesAST(while_node.cond);
+                for (while_node.body) |*stmt| {
+                    try self.resolveScopesAST(stmt);
+                }
+            },
+            .List => |list_node| {
+                for (list_node.elts) |*elt| {
+                    try self.resolveScopesAST(elt);
+                }
+            },
+            .Tuple => |tuple_node| {
+                for (tuple_node.elts) |*elt| {
+                    try self.resolveScopesAST(elt);
+                }
+            },
+            .Dict => |dict_node| {
+                for (dict_node.keys, 0..) |*key, i| {
+                    try self.resolveScopesAST(key);
+                    try self.resolveScopesAST(&dict_node.values[i]);
+                }
+            },
+            .FunctionDef => |func_def| {
+                var child_compiler = Compiler.init(self.allocator, self.mm);
+                child_compiler.parent = self;
+                child_compiler.is_function = true;
+                defer child_compiler.deinit();
+                
+                for (func_def.args) |arg| {
+                    try child_compiler.locals.put(arg, {});
+                }
+                try child_compiler.preScanLocals(func_def.body);
+                try child_compiler.resolveFunctionScopes(func_def.body);
+            },
+            .Return => |ret| {
+                if (ret.value) |val| {
+                    try self.resolveScopesAST(val);
+                }
+            },
+            .Call => |call_node| {
+                try self.resolveScopesAST(call_node.func);
+                for (call_node.args) |*arg| {
+                    try self.resolveScopesAST(arg);
+                }
+            },
+            .ClassDef => |class_def| {
+                var child_compiler = Compiler.init(self.allocator, self.mm);
+                child_compiler.parent = self;
+                child_compiler.is_function = false;
+                defer child_compiler.deinit();
+                
+                try child_compiler.preScanLocals(class_def.body);
+                try child_compiler.resolveFunctionScopes(class_def.body);
+            },
+            .Attribute => |attr_node| {
+                try self.resolveScopesAST(attr_node.value);
+            },
+            .AssignAttr => |assign_attr| {
+                try self.resolveScopesAST(assign_attr.expr);
+                try self.resolveScopesAST(assign_attr.value);
+            },
+            .Try => |try_node| {
+                for (try_node.body) |*stmt| {
+                    try self.resolveScopesAST(stmt);
+                }
+                for (try_node.handlers) |*h| {
+                    for (h.body) |*stmt| {
+                        try self.resolveScopesAST(stmt);
+                    }
+                }
+                for (try_node.finalbody) |*stmt| {
+                    try self.resolveScopesAST(stmt);
+                }
+            },
+            .Raise => |raise_node| {
+                if (raise_node.exc) |exc| {
+                    try self.resolveScopesAST(exc);
+                }
+            },
+            .Nonlocal => |nonlocal_node| {
+                for (nonlocal_node.names) |name| {
+                    try self.nonlocals.put(name, {});
+                }
+            },
+            .Import => {},
+            .ImportFrom => {},
+            .Pass => {},
         }
     }
 
@@ -524,6 +690,7 @@ pub const Compiler = struct {
         switch (node.*) {
             .Module => |mod| {
                 try self.preScanLocals(mod.body);
+                try self.resolveFunctionScopes(mod.body);
             },
             else => {},
         }
@@ -547,6 +714,7 @@ pub const Compiler = struct {
 test "compiler basic assignment and binary addition" {
     const allocator = testing.allocator;
     var mm = PyMemoryManager.init(allocator);
+    defer mm.deinit();
 
     var l_ptr = AST{ .Constant = .{ .Int = 10 } };
     var r_ptr = AST{ .Constant = .{ .Int = 20 } };

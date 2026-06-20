@@ -7,10 +7,37 @@ pub const PyMemoryManager = struct {
     peak_allocated_bytes: usize = 0,
     object_count: usize = 0,
 
+    int_free_list: ?*anyopaque = null,
+    float_free_list: ?*anyopaque = null,
+
     pub fn init(allocator: std.mem.Allocator) PyMemoryManager {
         return .{
             .allocator = allocator,
         };
+    }
+
+    pub fn deinit(self: *PyMemoryManager) void {
+        const primitives = @import("../objects/primitives.zig");
+        
+        var int_node = self.int_free_list;
+        while (int_node) |node| {
+            const next = @as(*?*anyopaque, @ptrCast(@alignCast(node))).*;
+            const ptr = @as(*primitives.PyIntObject, @ptrCast(@alignCast(node)));
+            self.allocator.destroy(ptr);
+            self.allocated_bytes -= @sizeOf(primitives.PyIntObject);
+            int_node = next;
+        }
+        self.int_free_list = null;
+
+        var float_node = self.float_free_list;
+        while (float_node) |node| {
+            const next = @as(*?*anyopaque, @ptrCast(@alignCast(node))).*;
+            const ptr = @as(*primitives.PyFloatObject, @ptrCast(@alignCast(node)));
+            self.allocator.destroy(ptr);
+            self.allocated_bytes -= @sizeOf(primitives.PyFloatObject);
+            float_node = next;
+        }
+        self.float_free_list = null;
     }
 
     pub fn alloc(self: *PyMemoryManager, comptime T: type) !*T {
@@ -51,6 +78,7 @@ test "memory manager basics" {
     const allocator = testing.allocator;
 
     var mm = PyMemoryManager.init(allocator);
+    defer mm.deinit();
 
     const MyStruct = struct {
         x: i32,

@@ -391,6 +391,7 @@ fn dict_repr(self: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
 test "tuple basic functionality" {
     const allocator = testing.allocator;
     var mm = PyMemoryManager.init(allocator);
+    defer mm.deinit();
 
     const int1 = try PyIntObject.create(10, &mm);
     const int2 = try PyIntObject.create(20, &mm);
@@ -420,6 +421,7 @@ test "tuple basic functionality" {
 test "list basic functionality" {
     const allocator = testing.allocator;
     var mm = PyMemoryManager.init(allocator);
+    defer mm.deinit();
 
     const list = try PyListObject.create(0, &mm);
     defer list.base.decRef(&mm);
@@ -436,6 +438,7 @@ test "list basic functionality" {
 test "dict basic functionality" {
     const allocator = testing.allocator;
     var mm = PyMemoryManager.init(allocator);
+    defer mm.deinit();
 
     const dict = try PyDictObject.create(&mm);
     defer dict.base.decRef(&mm);

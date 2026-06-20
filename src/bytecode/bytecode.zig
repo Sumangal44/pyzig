@@ -41,6 +41,8 @@ pub const Opcode = enum(u8) {
     IMPORT_FROM,
     POP_TOP,
     CHECK_EXCEPTION,
+    LOAD_FAST,
+    STORE_FAST,
 };
 
 pub const Instruction = struct {
