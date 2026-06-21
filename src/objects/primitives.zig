@@ -60,6 +60,8 @@ pub const PyBool_Type = PyTypeObject{
     .tp_repr = bool_repr,
     .tp_str = bool_repr,
     .tp_bool = bool_bool,
+    .tp_hash = bool_hash,
+    .tp_richcompare = bool_richcompare,
 };
 
 fn bool_repr(self: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
@@ -69,6 +71,17 @@ fn bool_repr(self: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
 
 fn bool_bool(self: *PyObject) bool {
     return self.as(PyBoolObject).value;
+}
+
+fn bool_hash(self: *PyObject) anyerror!i64 {
+    return if (self.as(PyBoolObject).value) @as(i64, 1) else @as(i64, 0);
+}
+
+fn bool_richcompare(self: *PyObject, other: *PyObject, op: CompareOp, mm: *PyMemoryManager) anyerror!*PyObject {
+    const val_int = if (self.as(PyBoolObject).value) @as(i64, 1) else @as(i64, 0);
+    var self_int = try PyIntObject.create(val_int, mm);
+    defer self_int.decRef(mm);
+    return try int_richcompare(self_int, other, op, mm);
 }
 
 fn makeSmallIntCache() [262]PyIntObject {
@@ -161,9 +174,10 @@ fn int_bool(self: *PyObject) bool {
 }
 
 fn int_add(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
-    if (other.type_obj == &PyInt_Type) {
+    const other_name = other.type_obj.name;
+    if (std.mem.eql(u8, other_name, "int")) {
         return try PyIntObject.create(self.as(PyIntObject).value + other.as(PyIntObject).value, mm);
-    } else if (other.type_obj == &PyFloat_Type) {
+    } else if (std.mem.eql(u8, other_name, "float")) {
         const a = @as(f64, @floatFromInt(self.as(PyIntObject).value));
         const b = other.as(PyFloatObject).value;
         return try PyFloatObject.create(a + b, mm);
@@ -172,9 +186,10 @@ fn int_add(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerror!*Py
 }
 
 fn int_sub(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
-    if (other.type_obj == &PyInt_Type) {
+    const other_name = other.type_obj.name;
+    if (std.mem.eql(u8, other_name, "int")) {
         return try PyIntObject.create(self.as(PyIntObject).value - other.as(PyIntObject).value, mm);
-    } else if (other.type_obj == &PyFloat_Type) {
+    } else if (std.mem.eql(u8, other_name, "float")) {
         const a = @as(f64, @floatFromInt(self.as(PyIntObject).value));
         const b = other.as(PyFloatObject).value;
         return try PyFloatObject.create(a - b, mm);
@@ -183,9 +198,10 @@ fn int_sub(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerror!*Py
 }
 
 fn int_mul(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
-    if (other.type_obj == &PyInt_Type) {
+    const other_name = other.type_obj.name;
+    if (std.mem.eql(u8, other_name, "int")) {
         return try PyIntObject.create(self.as(PyIntObject).value * other.as(PyIntObject).value, mm);
-    } else if (other.type_obj == &PyFloat_Type) {
+    } else if (std.mem.eql(u8, other_name, "float")) {
         const a = @as(f64, @floatFromInt(self.as(PyIntObject).value));
         const b = other.as(PyFloatObject).value;
         return try PyFloatObject.create(a * b, mm);
@@ -195,11 +211,12 @@ fn int_mul(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerror!*Py
 
 fn int_truediv(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
     const a = @as(f64, @floatFromInt(self.as(PyIntObject).value));
-    if (other.type_obj == &PyInt_Type) {
+    const other_name = other.type_obj.name;
+    if (std.mem.eql(u8, other_name, "int")) {
         const b = @as(f64, @floatFromInt(other.as(PyIntObject).value));
         if (b == 0.0) return error.ZeroDivisionError;
         return try PyFloatObject.create(a / b, mm);
-    } else if (other.type_obj == &PyFloat_Type) {
+    } else if (std.mem.eql(u8, other_name, "float")) {
         const b = other.as(PyFloatObject).value;
         if (b == 0.0) return error.ZeroDivisionError;
         return try PyFloatObject.create(a / b, mm);
@@ -220,13 +237,18 @@ fn match_cmp(a: anytype, b: anytype, op: CompareOp) bool {
 
 fn int_richcompare(self: *PyObject, other: *PyObject, op: CompareOp, mm: *PyMemoryManager) anyerror!*PyObject {
     _ = mm;
-    if (other.type_obj == &PyInt_Type) {
+    const other_name = other.type_obj.name;
+    if (std.mem.eql(u8, other_name, "int")) {
         const a = self.as(PyIntObject).value;
         const b = other.as(PyIntObject).value;
         return if (match_cmp(a, b, op)) PyTrue else PyFalse;
-    } else if (other.type_obj == &PyFloat_Type) {
+    } else if (std.mem.eql(u8, other_name, "float")) {
         const a = @as(f64, @floatFromInt(self.as(PyIntObject).value));
         const b = other.as(PyFloatObject).value;
+        return if (match_cmp(a, b, op)) PyTrue else PyFalse;
+    } else if (std.mem.eql(u8, other_name, "bool")) {
+        const a = self.as(PyIntObject).value;
+        const b = if (other.as(PyBoolObject).value) @as(i64, 1) else @as(i64, 0);
         return if (match_cmp(a, b, op)) PyTrue else PyFalse;
     }
     return error.TypeError;
@@ -282,7 +304,21 @@ fn float_dealloc(self: *PyObject, mm: *PyMemoryManager) void {
 fn float_repr(self: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
     const val = self.as(PyFloatObject).value;
     var buf: [64]u8 = undefined;
-    const slice = try std.fmt.bufPrint(&buf, "{d}", .{val});
+    var slice: []const u8 = undefined;
+    if (val == std.math.inf(f64)) {
+        slice = "inf";
+    } else if (val == -std.math.inf(f64)) {
+        slice = "-inf";
+    } else if (std.math.isNan(val)) {
+        slice = "nan";
+    } else {
+        const fmt_d = try std.fmt.bufPrint(&buf, "{d}", .{val});
+        if (std.mem.indexOfScalar(u8, fmt_d, '.') == null and std.mem.indexOfScalar(u8, fmt_d, 'e') == null) {
+            slice = try std.fmt.bufPrint(&buf, "{d}.0", .{val});
+        } else {
+            slice = fmt_d;
+        }
+    }
     return try PyStringObject.create(slice, mm);
 }
 
@@ -292,9 +328,10 @@ fn float_bool(self: *PyObject) bool {
 
 fn float_add(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
     const a = self.as(PyFloatObject).value;
-    if (other.type_obj == &PyFloat_Type) {
+    const other_name = other.type_obj.name;
+    if (std.mem.eql(u8, other_name, "float")) {
         return try PyFloatObject.create(a + other.as(PyFloatObject).value, mm);
-    } else if (other.type_obj == &PyInt_Type) {
+    } else if (std.mem.eql(u8, other_name, "int")) {
         const b = @as(f64, @floatFromInt(other.as(PyIntObject).value));
         return try PyFloatObject.create(a + b, mm);
     }
@@ -303,9 +340,10 @@ fn float_add(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerror!*
 
 fn float_sub(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
     const a = self.as(PyFloatObject).value;
-    if (other.type_obj == &PyFloat_Type) {
+    const other_name = other.type_obj.name;
+    if (std.mem.eql(u8, other_name, "float")) {
         return try PyFloatObject.create(a - other.as(PyFloatObject).value, mm);
-    } else if (other.type_obj == &PyInt_Type) {
+    } else if (std.mem.eql(u8, other_name, "int")) {
         const b = @as(f64, @floatFromInt(other.as(PyIntObject).value));
         return try PyFloatObject.create(a - b, mm);
     }
@@ -314,9 +352,10 @@ fn float_sub(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerror!*
 
 fn float_mul(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
     const a = self.as(PyFloatObject).value;
-    if (other.type_obj == &PyFloat_Type) {
+    const other_name = other.type_obj.name;
+    if (std.mem.eql(u8, other_name, "float")) {
         return try PyFloatObject.create(a * other.as(PyFloatObject).value, mm);
-    } else if (other.type_obj == &PyInt_Type) {
+    } else if (std.mem.eql(u8, other_name, "int")) {
         const b = @as(f64, @floatFromInt(other.as(PyIntObject).value));
         return try PyFloatObject.create(a * b, mm);
     }
@@ -325,11 +364,12 @@ fn float_mul(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerror!*
 
 fn float_truediv(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
     const a = self.as(PyFloatObject).value;
-    if (other.type_obj == &PyFloat_Type) {
+    const other_name = other.type_obj.name;
+    if (std.mem.eql(u8, other_name, "float")) {
         const b = other.as(PyFloatObject).value;
         if (b == 0.0) return error.ZeroDivisionError;
         return try PyFloatObject.create(a / b, mm);
-    } else if (other.type_obj == &PyInt_Type) {
+    } else if (std.mem.eql(u8, other_name, "int")) {
         const b = @as(f64, @floatFromInt(other.as(PyIntObject).value));
         if (b == 0.0) return error.ZeroDivisionError;
         return try PyFloatObject.create(a / b, mm);
@@ -340,11 +380,15 @@ fn float_truediv(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerr
 fn float_richcompare(self: *PyObject, other: *PyObject, op: CompareOp, mm: *PyMemoryManager) anyerror!*PyObject {
     _ = mm;
     const a = self.as(PyFloatObject).value;
-    if (other.type_obj == &PyFloat_Type) {
+    const other_name = other.type_obj.name;
+    if (std.mem.eql(u8, other_name, "float")) {
         const b = other.as(PyFloatObject).value;
         return if (match_cmp(a, b, op)) PyTrue else PyFalse;
-    } else if (other.type_obj == &PyInt_Type) {
+    } else if (std.mem.eql(u8, other_name, "int")) {
         const b = @as(f64, @floatFromInt(other.as(PyIntObject).value));
+        return if (match_cmp(a, b, op)) PyTrue else PyFalse;
+    } else if (std.mem.eql(u8, other_name, "bool")) {
+        const b = if (other.as(PyBoolObject).value) @as(f64, 1.0) else @as(f64, 0.0);
         return if (match_cmp(a, b, op)) PyTrue else PyFalse;
     }
     return error.TypeError;

@@ -63,7 +63,7 @@ pub const PyMethodObject = extern struct {
 };
 
 pub const PyClass_Type = PyTypeObject{
-    .name = "type",
+    .name = "class_type",
     .tp_dealloc = class_dealloc,
     .tp_repr = class_repr,
     .tp_str = class_repr,

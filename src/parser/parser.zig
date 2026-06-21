@@ -54,7 +54,7 @@ pub const Parser = struct {
         return error.ParseError;
     }
 
-    fn saveState(self: Parser) ParserState {
+    fn saveState(self: *Parser) ParserState {
         return .{
             .lexer_state = self.lexer.save(),
             .current_token = self.current_token,
@@ -66,118 +66,141 @@ pub const Parser = struct {
         self.current_token = state.current_token;
     }
 
-    pub fn parseModule(self: *Parser) anyerror!AST {
-        var body = std.ArrayList(AST).empty;
-        errdefer body.deinit(self.builder.allocator);
-
-        while (self.peekType() != .eof) {
-            if (self.match(.newline)) continue;
-            const stmt = try self.parseStatement();
-            try body.append(self.builder.allocator, stmt);
-            if (self.peekType() != .eof) {
-                const is_compound = switch (stmt) {
-                    .If, .While, .FunctionDef, .ClassDef, .Try => true,
-                    else => false,
-                };
-                if (!is_compound) {
-                    try self.consume(.newline, "Expect newline after statement");
-                } else {
-                    _ = self.match(.newline);
-                }
-            }
+    fn skipNewlines(self: *Parser) void {
+        while (self.peekType() == .newline) {
+            self.advance();
         }
-
-        return AST{ .Module = .{ .body = try body.toOwnedSlice(self.builder.allocator) } };
     }
 
     fn parseBlock(self: *Parser) anyerror![]AST {
-        try self.consume(.newline, "Expect newline before block");
-        try self.consume(.indent, "Expect indent to start block");
+        self.skipNewlines();
+        try self.consume(.indent, "Expect indented block");
         
-        var body = std.ArrayList(AST).empty;
-        errdefer body.deinit(self.builder.allocator);
+        var stmts = std.ArrayList(AST).empty;
+        errdefer stmts.deinit(self.builder.allocator);
         
         while (self.peekType() != .dedent and self.peekType() != .eof) {
-            if (self.match(.newline)) continue;
+            self.skipNewlines();
+            if (self.peekType() == .dedent or self.peekType() == .eof) break;
             const stmt = try self.parseStatement();
-            try body.append(self.builder.allocator, stmt);
-            if (self.peekType() != .dedent and self.peekType() != .eof) {
-                const is_compound = switch (stmt) {
-                    .If, .While, .FunctionDef, .ClassDef, .Try => true,
-                    else => false,
-                };
-                if (!is_compound) {
-                    try self.consume(.newline, "Expect newline after statement in block");
-                } else {
-                    _ = self.match(.newline);
-                }
-            }
+            try stmts.append(self.builder.allocator, stmt);
+            self.skipNewlines();
         }
         
-        try self.consume(.dedent, "Expect dedent to end block");
-        return try body.toOwnedSlice(self.builder.allocator);
+        if (self.peekType() == .dedent) {
+            self.advance();
+        }
+        
+        return try stmts.toOwnedSlice(self.builder.allocator);
+    }
+
+    pub fn parseModule(self: *Parser) anyerror!AST {
+        var stmts = std.ArrayList(AST).empty;
+        errdefer stmts.deinit(self.builder.allocator);
+        
+        while (self.peekType() != .eof) {
+            self.skipNewlines();
+            if (self.peekType() == .eof) break;
+            const stmt = try self.parseStatement();
+            try stmts.append(self.builder.allocator, stmt);
+            self.skipNewlines();
+        }
+        
+        return AST{ .Module = .{
+            .body = try stmts.toOwnedSlice(self.builder.allocator),
+        } };
     }
 
     fn parseIfStatement(self: *Parser) anyerror!AST {
         try self.consume(.kw_if, "Expect 'if'");
         const cond = try self.parseExpression();
-        try self.consume(.colon, "Expect ':' after condition");
+        try self.consume(.colon, "Expect ':' after if condition");
         const body = try self.parseBlock();
         
-        var orelse_list = std.ArrayList(AST).empty;
-        errdefer orelse_list.deinit(self.builder.allocator);
-        
+        var orelse_body: []AST = &[_]AST{};
         if (self.match(.kw_elif)) {
-            const elif_ast = try self.parseElifRecursive();
-            try orelse_list.append(self.builder.allocator, elif_ast);
+            // Re-parse as if statement
+            const elif_cond = try self.parseExpression();
+            try self.consume(.colon, "Expect ':' after elif condition");
+            const elif_body = try self.parseBlock();
+            
+            var elif_orelse: []AST = &[_]AST{};
+            if (self.peekType() == .kw_elif) {
+                // Recursive elif
+                const inner = try self.parseElifChain();
+                var arr = try self.builder.allocator.alloc(AST, 1);
+                arr[0] = inner;
+                elif_orelse = arr;
+            } else if (self.match(.kw_else)) {
+                try self.consume(.colon, "Expect ':' after else");
+                elif_orelse = try self.parseBlock();
+            }
+            
+            var arr = try self.builder.allocator.alloc(AST, 1);
+            arr[0] = AST{ .If = .{
+                .cond = try self.builder.newAST(elif_cond),
+                .body = elif_body,
+                .orelse_body = elif_orelse,
+            } };
+            orelse_body = arr;
         } else if (self.match(.kw_else)) {
             try self.consume(.colon, "Expect ':' after else");
-            const else_body = try self.parseBlock();
-            for (else_body) |stmt| {
-                try orelse_list.append(self.builder.allocator, stmt);
-            }
+            orelse_body = try self.parseBlock();
         }
         
         return AST{ .If = .{
             .cond = try self.builder.newAST(cond),
             .body = body,
-            .orelse_body = try orelse_list.toOwnedSlice(self.builder.allocator),
+            .orelse_body = orelse_body,
         } };
     }
 
-    fn parseElifRecursive(self: *Parser) anyerror!AST {
+    fn parseElifChain(self: *Parser) anyerror!AST {
+        try self.consume(.kw_elif, "Expect 'elif'");
         const cond = try self.parseExpression();
-        try self.consume(.colon, "Expect ':' after condition");
+        try self.consume(.colon, "Expect ':' after elif condition");
         const body = try self.parseBlock();
         
-        var orelse_list = std.ArrayList(AST).empty;
-        errdefer orelse_list.deinit(self.builder.allocator);
-        
-        if (self.match(.kw_elif)) {
-            const elif_ast = try self.parseElifRecursive();
-            try orelse_list.append(self.builder.allocator, elif_ast);
+        var orelse_body: []AST = &[_]AST{};
+        if (self.peekType() == .kw_elif) {
+            const inner = try self.parseElifChain();
+            var arr = try self.builder.allocator.alloc(AST, 1);
+            arr[0] = inner;
+            orelse_body = arr;
         } else if (self.match(.kw_else)) {
             try self.consume(.colon, "Expect ':' after else");
-            const else_body = try self.parseBlock();
-            for (else_body) |stmt| {
-                try orelse_list.append(self.builder.allocator, stmt);
-            }
+            orelse_body = try self.parseBlock();
         }
         
         return AST{ .If = .{
             .cond = try self.builder.newAST(cond),
             .body = body,
-            .orelse_body = try orelse_list.toOwnedSlice(self.builder.allocator),
+            .orelse_body = orelse_body,
         } };
     }
 
     fn parseWhileStatement(self: *Parser) anyerror!AST {
         try self.consume(.kw_while, "Expect 'while'");
         const cond = try self.parseExpression();
-        try self.consume(.colon, "Expect ':' after condition");
+        try self.consume(.colon, "Expect ':' after while condition");
         const body = try self.parseBlock();
         return AST{ .While = .{
             .cond = try self.builder.newAST(cond),
+            .body = body,
+        } };
+    }
+
+    fn parseForStatement(self: *Parser) anyerror!AST {
+        try self.consume(.kw_for, "Expect 'for'");
+        const target = self.current_token.lexeme;
+        try self.consume(.identifier, "Expect loop variable name");
+        try self.consume(.kw_in, "Expect 'in' after for variable");
+        const iter = try self.parseExpression();
+        try self.consume(.colon, "Expect ':' after for iterable");
+        const body = try self.parseBlock();
+        return AST{ .For = .{
+            .target = try self.builder.allocator.dupe(u8, target),
+            .iter = try self.builder.newAST(iter),
             .body = body,
         } };
     }
@@ -189,33 +212,39 @@ pub const Parser = struct {
         try self.consume(.lparen, "Expect '(' after function name");
         
         var args = std.ArrayList([]const u8).empty;
+        var defaults = std.ArrayList(AST).empty;
         errdefer {
-            for (args.items) |arg| {
-                self.builder.allocator.free(arg);
-            }
+            for (args.items) |a| self.builder.allocator.free(a);
             args.deinit(self.builder.allocator);
+            defaults.deinit(self.builder.allocator);
         }
         
         while (self.peekType() != .rparen) {
             const arg_name = self.current_token.lexeme;
             try self.consume(.identifier, "Expect parameter name");
-            const arg_copy = try self.builder.allocator.dupe(u8, arg_name);
-            try args.append(self.builder.allocator, arg_copy);
+            try args.append(self.builder.allocator, try self.builder.allocator.dupe(u8, arg_name));
+            
+            // Check for default value
+            if (self.match(.equal)) {
+                const default_val = try self.parseExpression();
+                try defaults.append(self.builder.allocator, default_val);
+            }
             
             if (self.peekType() == .comma) {
                 self.advance();
             } else if (self.peekType() != .rparen) {
+                std.debug.print("parseFunctionDef: unexpected token '{s}' ({s}) at line {d}, col {d}\n", .{self.current_token.lexeme, @tagName(self.peekType()), self.current_token.line, self.current_token.column});
                 return error.ParseError;
             }
         }
         try self.consume(.rparen, "Expect ')' after parameters");
         try self.consume(.colon, "Expect ':' after function signature");
-        
         const body = try self.parseBlock();
-        
+
         return AST{ .FunctionDef = .{
             .name = try self.builder.allocator.dupe(u8, name_tok.lexeme),
             .args = try args.toOwnedSlice(self.builder.allocator),
+            .defaults = try defaults.toOwnedSlice(self.builder.allocator),
             .body = body,
         } };
     }
@@ -229,12 +258,86 @@ pub const Parser = struct {
         return AST{ .Return = .{ .value = try self.builder.newAST(expr) } };
     }
 
+    fn parseAssertStatement(self: *Parser) anyerror!AST {
+        try self.consume(.kw_assert, "Expect 'assert'");
+        const test_expr = try self.parseExpression();
+        var msg: ?*AST = null;
+        if (self.match(.comma)) {
+            const msg_expr = try self.parseExpression();
+            msg = try self.builder.newAST(msg_expr);
+        }
+        return AST{ .Assert = .{
+            .test_expr = try self.builder.newAST(test_expr),
+            .msg = msg,
+        } };
+    }
+
+    fn parseDelStatement(self: *Parser) anyerror!AST {
+        try self.consume(.kw_del, "Expect 'del'");
+        // Parse a full expression (Name, Subscript, or Attribute)
+        const target_expr = try self.parseExpression();
+        // Normalize: if it's just a Name, we can use it directly; otherwise we need
+        // the full expression tree for subscript/attribute deletion.
+        return AST{ .Del = .{
+            .target = try self.builder.newAST(target_expr),
+        } };
+    }
+
+    fn parseGlobalStatement(self: *Parser) anyerror!AST {
+        try self.consume(.kw_global, "Expect 'global'");
+        var names = std.ArrayList([]const u8).empty;
+        errdefer {
+            for (names.items) |name| self.builder.allocator.free(name);
+            names.deinit(self.builder.allocator);
+        }
+        while (true) {
+            const name = self.current_token.lexeme;
+            try self.consume(.identifier, "Expect variable name in global");
+            try names.append(self.builder.allocator, try self.builder.allocator.dupe(u8, name));
+            if (self.match(.comma)) {
+                continue;
+            }
+            break;
+        }
+        return AST{ .Global = .{ .names = try names.toOwnedSlice(self.builder.allocator) } };
+    }
+
+    fn parseLambda(self: *Parser) anyerror!AST {
+        try self.consume(.kw_lambda, "Expect 'lambda'");
+        var args = std.ArrayList([]const u8).empty;
+        errdefer {
+            for (args.items) |a| self.builder.allocator.free(a);
+            args.deinit(self.builder.allocator);
+        }
+        
+        if (self.peekType() != .colon) {
+            while (true) {
+                const arg_name = self.current_token.lexeme;
+                try self.consume(.identifier, "Expect parameter name in lambda");
+                try args.append(self.builder.allocator, try self.builder.allocator.dupe(u8, arg_name));
+                if (self.match(.comma)) {
+                    continue;
+                }
+                break;
+            }
+        }
+        try self.consume(.colon, "Expect ':' after lambda parameters");
+        const body = try self.parseExpression();
+        return AST{ .Lambda = .{
+            .args = try args.toOwnedSlice(self.builder.allocator),
+            .body = try self.builder.newAST(body),
+        } };
+    }
+
     fn parseStatement(self: *Parser) anyerror!AST {
         if (self.peekType() == .kw_if) {
             return try self.parseIfStatement();
         }
         if (self.peekType() == .kw_while) {
             return try self.parseWhileStatement();
+        }
+        if (self.peekType() == .kw_for) {
+            return try self.parseForStatement();
         }
         if (self.peekType() == .kw_def) {
             return try self.parseFunctionDef();
@@ -251,6 +354,9 @@ pub const Parser = struct {
         if (self.peekType() == .kw_nonlocal) {
             return try self.parseNonlocalStatement();
         }
+        if (self.peekType() == .kw_global) {
+            return try self.parseGlobalStatement();
+        }
         if (self.peekType() == .kw_import) {
             return try self.parseImportStatement();
         }
@@ -260,11 +366,23 @@ pub const Parser = struct {
         if (self.peekType() == .kw_return) {
             return try self.parseReturnStatement();
         }
+        if (self.peekType() == .kw_assert) {
+            return try self.parseAssertStatement();
+        }
+        if (self.peekType() == .kw_del) {
+            return try self.parseDelStatement();
+        }
         if (self.match(.kw_pass)) {
             return AST{ .Pass = {} };
         }
+        if (self.match(.kw_break)) {
+            return AST{ .Break = {} };
+        }
+        if (self.match(.kw_continue)) {
+            return AST{ .Continue = {} };
+        }
 
-        // Try parsing Assignment: target = expr
+        // Try parsing Assignment: target = expr or target op= expr
         const state = self.saveState();
         if (self.peekType() == .identifier) {
             const target_expr = self.parsePrimary() catch blk: {
@@ -272,6 +390,7 @@ pub const Parser = struct {
                 break :blk null;
             };
             if (target_expr) |t| {
+                // Simple assignment
                 if (self.match(.equal)) {
                     const expr = try self.parseExpression();
                     switch (t) {
@@ -284,6 +403,43 @@ pub const Parser = struct {
                                 .attr = attr.attr,
                                 .expr = try self.builder.newAST(expr),
                             } };
+                        },
+                        .Subscript => |sub| {
+                            return AST{ .AssignSubscript = .{
+                                .value = sub.value,
+                                .index = sub.index,
+                                .expr = try self.builder.newAST(expr),
+                            } };
+                        },
+                        else => {
+                            self.restoreState(state);
+                        },
+                    }
+                }
+                // Augmented assignment
+                else if (self.peekType() == .plus_equal or
+                         self.peekType() == .minus_equal or
+                         self.peekType() == .star_equal or
+                         self.peekType() == .slash_equal or
+                         self.peekType() == .percent_equal or
+                         self.peekType() == .double_star_equal or
+                         self.peekType() == .double_slash_equal)
+                {
+                    const op: Op = switch (self.peekType()) {
+                        .plus_equal => .Add,
+                        .minus_equal => .Sub,
+                        .star_equal => .Mul,
+                        .slash_equal => .Div,
+                        .percent_equal => .Mod,
+                        .double_star_equal => .Pow,
+                        .double_slash_equal => .FloorDiv,
+                        else => unreachable,
+                    };
+                    self.advance(); // consume the augmented assignment token
+                    const expr = try self.parseExpression();
+                    switch (t) {
+                        .Name => |n| {
+                            return AST{ .AugAssign = .{ .target = n, .op = op, .value = try self.builder.newAST(expr) } };
                         },
                         else => {
                             self.restoreState(state);
@@ -311,6 +467,58 @@ pub const Parser = struct {
     }
 
     fn parseExpression(self: *Parser) anyerror!AST {
+        // Check for lambda
+        if (self.peekType() == .kw_lambda) {
+            return try self.parseLambda();
+        }
+        return try self.parseOrTest();
+    }
+
+    fn parseOrTest(self: *Parser) anyerror!AST {
+        var expr = try self.parseAndTest();
+        while (true) {
+            if (self.peekType() == .kw_or) {
+                self.advance();
+                const right = try self.parseAndTest();
+                expr = AST{ .LogicalOp = .{
+                    .op = .Or,
+                    .left = try self.builder.newAST(expr),
+                    .right = try self.builder.newAST(right),
+                } };
+            } else {
+                break;
+            }
+        }
+        return expr;
+    }
+
+    fn parseAndTest(self: *Parser) anyerror!AST {
+        var expr = try self.parseNotTest();
+        while (true) {
+            if (self.peekType() == .kw_and) {
+                self.advance();
+                const right = try self.parseNotTest();
+                expr = AST{ .LogicalOp = .{
+                    .op = .And,
+                    .left = try self.builder.newAST(expr),
+                    .right = try self.builder.newAST(right),
+                } };
+            } else {
+                break;
+            }
+        }
+        return expr;
+    }
+
+    fn parseNotTest(self: *Parser) anyerror!AST {
+        if (self.peekType() == .kw_not) {
+            self.advance();
+            const operand = try self.parseNotTest();
+            return AST{ .UnaryOp = .{
+                .op = .Not,
+                .operand = try self.builder.newAST(operand),
+            } };
+        }
         return try self.parseComparison();
     }
 
@@ -324,10 +532,39 @@ pub const Parser = struct {
                 .not_equal => .Ne,
                 .greater => .Gt,
                 .greater_equal => .Ge,
+                .kw_is => blk: {
+                    self.advance();
+                    if (self.peekType() == .kw_not) {
+                        self.advance();
+                        break :blk CompareOp.IsNot;
+                    }
+                    // Already consumed 'is'
+                    const right = try self.parseTerm();
+                    expr = AST{ .Compare = .{
+                        .op = .Is,
+                        .left = try self.builder.newAST(expr),
+                        .right = try self.builder.newAST(right),
+                    } };
+                    continue;
+                },
+                .kw_not => blk: {
+                    // "not in"
+                    const save = self.saveState();
+                    self.advance();
+                    if (self.peekType() == .kw_in) {
+                        self.advance();
+                        break :blk CompareOp.NotIn;
+                    }
+                    self.restoreState(save);
+                    break :blk null;
+                },
+                .kw_in => .In,
                 else => null,
             };
             if (op) |cmp_op| {
-                self.advance();
+                if (cmp_op != .Is and cmp_op != .IsNot and cmp_op != .NotIn) {
+                    self.advance();
+                }
                 const right = try self.parseTerm();
                 expr = AST{ .Compare = .{
                     .op = cmp_op,
@@ -365,16 +602,18 @@ pub const Parser = struct {
     }
 
     fn parseFactor(self: *Parser) anyerror!AST {
-        var expr = try self.parsePrimary();
+        var expr = try self.parseUnary();
         while (true) {
             const op: ?Op = switch (self.peekType()) {
                 .star => .Mul,
                 .slash => .Div,
+                .percent => .Mod,
+                .double_slash => .FloorDiv,
                 else => null,
             };
             if (op) |bin_op| {
                 self.advance();
-                const right = try self.parsePrimary();
+                const right = try self.parseUnary();
                 expr = AST{ .BinOp = .{
                     .op = bin_op,
                     .left = try self.builder.newAST(expr),
@@ -383,6 +622,31 @@ pub const Parser = struct {
             } else {
                 break;
             }
+        }
+        return expr;
+    }
+
+    fn parseUnary(self: *Parser) anyerror!AST {
+        if (self.match(.minus)) {
+            const operand = try self.parsePower();
+            return AST{ .UnaryOp = .{
+                .op = .Neg,
+                .operand = try self.builder.newAST(operand),
+            } };
+        }
+        return try self.parsePower();
+    }
+
+    fn parsePower(self: *Parser) anyerror!AST {
+        var expr = try self.parsePrimary();
+        if (self.peekType() == .double_star) {
+            self.advance();
+            const right = try self.parseUnary(); // right-associative
+            expr = AST{ .BinOp = .{
+                .op = .Pow,
+                .left = try self.builder.newAST(expr),
+                .right = try self.builder.newAST(right),
+            } };
         }
         return expr;
     }
@@ -428,6 +692,7 @@ pub const Parser = struct {
                 if (self.peekType() == .comma) {
                     self.advance();
                 } else if (self.peekType() != .rbracket) {
+                    std.debug.print("parseBase (list): unexpected token '{s}' ({s}) at line {d}, col {d}\n", .{self.current_token.lexeme, @tagName(self.peekType()), self.current_token.line, self.current_token.column});
                     return error.ParseError;
                 }
             }
@@ -451,6 +716,7 @@ pub const Parser = struct {
                     if (self.peekType() == .comma) {
                         self.advance();
                     } else if (self.peekType() != .rparen) {
+                        std.debug.print("parseBase (tuple): unexpected token '{s}' ({s}) at line {d}, col {d}\n", .{self.current_token.lexeme, @tagName(self.peekType()), self.current_token.line, self.current_token.column});
                         return error.ParseError;
                     }
                 }
@@ -481,6 +747,7 @@ pub const Parser = struct {
                 if (self.peekType() == .comma) {
                     self.advance();
                 } else if (self.peekType() != .rbrace) {
+                    std.debug.print("parseBase (dict): unexpected token '{s}' ({s}) at line {d}, col {d}\n", .{self.current_token.lexeme, @tagName(self.peekType()), self.current_token.line, self.current_token.column});
                     return error.ParseError;
                 }
             }
@@ -491,6 +758,7 @@ pub const Parser = struct {
             } };
         }
 
+        std.debug.print("parseBase: unexpected token '{s}' ({s}) at line {d}, col {d}\n", .{self.current_token.lexeme, @tagName(self.peekType()), self.current_token.line, self.current_token.column});
         return error.ParseError;
     }
 
@@ -507,6 +775,7 @@ pub const Parser = struct {
                     if (self.peekType() == .comma) {
                         self.advance();
                     } else if (self.peekType() != .rparen) {
+                        std.debug.print("parsePrimary (call): unexpected token '{s}' ({s}) at line {d}, col {d}\n", .{self.current_token.lexeme, @tagName(self.peekType()), self.current_token.line, self.current_token.column});
                         return error.ParseError;
                     }
                 }
@@ -521,6 +790,13 @@ pub const Parser = struct {
                 expr = AST{ .Attribute = .{
                     .value = try self.builder.newAST(expr),
                     .attr = try self.builder.allocator.dupe(u8, name),
+                } };
+            } else if (self.match(.lbracket)) {
+                const index = try self.parseExpression();
+                try self.consume(.rbracket, "Expect ']' after subscript");
+                expr = AST{ .Subscript = .{
+                    .value = try self.builder.newAST(expr),
+                    .index = try self.builder.newAST(index),
                 } };
             } else {
                 break;

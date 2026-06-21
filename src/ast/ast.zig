@@ -5,6 +5,9 @@ pub const Op = enum {
     Sub,
     Mul,
     Div,
+    Mod,
+    Pow,
+    FloorDiv,
 };
 
 pub const CompareOp = enum {
@@ -14,6 +17,10 @@ pub const CompareOp = enum {
     Ne,
     Gt,
     Ge,
+    Is,
+    IsNot,
+    In,
+    NotIn,
 };
 
 pub const ConstantValue = union(enum) {
@@ -36,6 +43,11 @@ pub const AST = union(enum) {
     },
     Assign: struct {
         target: []const u8,
+        value: *AST,
+    },
+    AugAssign: struct {
+        target: []const u8,
+        op: Op,
         value: *AST,
     },
     BinOp: struct {
@@ -62,6 +74,13 @@ pub const AST = union(enum) {
         cond: *AST,
         body: []AST,
     },
+    For: struct {
+        target: []const u8,
+        iter: *AST,
+        body: []AST,
+    },
+    Break: void,
+    Continue: void,
     List: struct {
         elts: []AST,
     },
@@ -75,7 +94,12 @@ pub const AST = union(enum) {
     FunctionDef: struct {
         name: []const u8,
         args: [][]const u8,
+        defaults: []AST,
         body: []AST,
+    },
+    Lambda: struct {
+        args: [][]const u8,
+        body: *AST,
     },
     Return: struct {
         value: ?*AST,
@@ -99,6 +123,15 @@ pub const AST = union(enum) {
         attr: []const u8,
         expr: *AST,
     },
+    Subscript: struct {
+        value: *AST,
+        index: *AST,
+    },
+    AssignSubscript: struct {
+        value: *AST,
+        index: *AST,
+        expr: *AST,
+    },
     Try: struct {
         body: []AST,
         handlers: []ExceptHandler,
@@ -110,12 +143,31 @@ pub const AST = union(enum) {
     Nonlocal: struct {
         names: [][]const u8,
     },
+    Global: struct {
+        names: [][]const u8,
+    },
+    Assert: struct {
+        test_expr: *AST,
+        msg: ?*AST,
+    },
+    Del: struct {
+        target: *AST,
+    },
     Import: struct {
         names: [][]const u8,
     },
     ImportFrom: struct {
         module: []const u8,
         names: [][]const u8,
+    },
+    LogicalOp: struct {
+        op: enum { And, Or },
+        left: *AST,
+        right: *AST,
+    },
+    UnaryOp: struct {
+        op: enum { Not, Neg },
+        operand: *AST,
     },
 };
 

@@ -5,7 +5,8 @@ pub const TokenType = enum {
     // Keywords
     kw_def, kw_class, kw_return, kw_if, kw_else, kw_elif, kw_while, kw_for, kw_in, kw_import, kw_from, kw_as,
     kw_and, kw_or, kw_not, kw_is, kw_None, kw_True, kw_False, kw_pass, kw_break, kw_continue, kw_lambda,
-    kw_try, kw_except, kw_finally, kw_raise, kw_nonlocal,
+    kw_try, kw_except, kw_finally, kw_raise, kw_nonlocal, kw_assert, kw_async, kw_await, kw_del, kw_global,
+    kw_with, kw_yield,
 
     // Identifiers and Literals
     identifier,
@@ -17,7 +18,11 @@ pub const TokenType = enum {
     plus, minus, star, slash, percent, equal, double_equal, not_equal,
     less, less_equal, greater, greater_equal,
     lparen, rparen, lbrace, rbrace, lbracket, rbracket,
-    colon, comma, newline, indent, dedent, dot,
+    colon, comma, newline, indent, dedent, dot, semicolon,
+    // Augmented assignment and compound operators
+    plus_equal, minus_equal, star_equal, slash_equal, percent_equal,
+    double_star, double_slash,
+    double_star_equal, double_slash_equal,
 
     // Special
     eof,
@@ -250,11 +255,65 @@ pub const Lexer = struct {
                 ':' => return .{ .type = .colon, .lexeme = ":", .line = start_line, .column = start_col },
                 ',' => return .{ .type = .comma, .lexeme = ",", .line = start_line, .column = start_col },
                 '.' => return .{ .type = .dot, .lexeme = ".", .line = start_line, .column = start_col },
-                '+' => return .{ .type = .plus, .lexeme = "+", .line = start_line, .column = start_col },
-                '-' => return .{ .type = .minus, .lexeme = "-", .line = start_line, .column = start_col },
-                '*' => return .{ .type = .star, .lexeme = "*", .line = start_line, .column = start_col },
-                '/' => return .{ .type = .slash, .lexeme = "/", .line = start_line, .column = start_col },
-                '%' => return .{ .type = .percent, .lexeme = "%", .line = start_line, .column = start_col },
+                ';' => {
+                    // Treat semicolons as newlines (statement separator)
+                    // Do NOT set at_line_start - semicolons don't create new indentation contexts.
+                    // The space after a `;` is not Python indentation.
+                    if (self.paren_depth == 0) {
+                        return .{ .type = .newline, .lexeme = ";", .line = start_line, .column = start_col };
+                    }
+                },
+                '+' => {
+                    if (self.peek() == '=') {
+                        _ = self.advance();
+                        return .{ .type = .plus_equal, .lexeme = "+=", .line = start_line, .column = start_col };
+                    }
+                    return .{ .type = .plus, .lexeme = "+", .line = start_line, .column = start_col };
+                },
+                '-' => {
+                    if (self.peek() == '=') {
+                        _ = self.advance();
+                        return .{ .type = .minus_equal, .lexeme = "-=", .line = start_line, .column = start_col };
+                    }
+                    return .{ .type = .minus, .lexeme = "-", .line = start_line, .column = start_col };
+                },
+                '*' => {
+                    if (self.peek() == '*') {
+                        _ = self.advance();
+                        if (self.peek() == '=') {
+                            _ = self.advance();
+                            return .{ .type = .double_star_equal, .lexeme = "**=", .line = start_line, .column = start_col };
+                        }
+                        return .{ .type = .double_star, .lexeme = "**", .line = start_line, .column = start_col };
+                    }
+                    if (self.peek() == '=') {
+                        _ = self.advance();
+                        return .{ .type = .star_equal, .lexeme = "*=", .line = start_line, .column = start_col };
+                    }
+                    return .{ .type = .star, .lexeme = "*", .line = start_line, .column = start_col };
+                },
+                '/' => {
+                    if (self.peek() == '/') {
+                        _ = self.advance();
+                        if (self.peek() == '=') {
+                            _ = self.advance();
+                            return .{ .type = .double_slash_equal, .lexeme = "//=", .line = start_line, .column = start_col };
+                        }
+                        return .{ .type = .double_slash, .lexeme = "//", .line = start_line, .column = start_col };
+                    }
+                    if (self.peek() == '=') {
+                        _ = self.advance();
+                        return .{ .type = .slash_equal, .lexeme = "/=", .line = start_line, .column = start_col };
+                    }
+                    return .{ .type = .slash, .lexeme = "/", .line = start_line, .column = start_col };
+                },
+                '%' => {
+                    if (self.peek() == '=') {
+                        _ = self.advance();
+                        return .{ .type = .percent_equal, .lexeme = "%=", .line = start_line, .column = start_col };
+                    }
+                    return .{ .type = .percent, .lexeme = "%", .line = start_line, .column = start_col };
+                },
                 '=' => {
                     if (self.peek() == '=') {
                         _ = self.advance();
@@ -385,6 +444,13 @@ pub const Lexer = struct {
         if (std.mem.eql(u8, lexeme, "raise")) return .kw_raise;
         if (std.mem.eql(u8, lexeme, "nonlocal")) return .kw_nonlocal;
         if (std.mem.eql(u8, lexeme, "lambda")) return .kw_lambda;
+        if (std.mem.eql(u8, lexeme, "assert")) return .kw_assert;
+        if (std.mem.eql(u8, lexeme, "async")) return .kw_async;
+        if (std.mem.eql(u8, lexeme, "await")) return .kw_await;
+        if (std.mem.eql(u8, lexeme, "del")) return .kw_del;
+        if (std.mem.eql(u8, lexeme, "global")) return .kw_global;
+        if (std.mem.eql(u8, lexeme, "with")) return .kw_with;
+        if (std.mem.eql(u8, lexeme, "yield")) return .kw_yield;
         return .identifier;
     }
 };
@@ -426,6 +492,24 @@ test "lexer ignore newline inside parens" {
     
     const expected = [_]TokenType{
         .lparen, .number_int, .plus, .number_int, .rparen, .eof
+    };
+
+    for (expected) |t_type| {
+        const token = lexer.next();
+        try testing.expectEqual(t_type, token.type);
+    }
+}
+
+test "lexer all standard python keywords" {
+    const src = "def class return if else elif while for in import from as and or not is None True False pass break continue try except finally raise nonlocal lambda assert async await del global with yield";
+    var lexer = Lexer.init(src);
+    
+    const expected = [_]TokenType{
+        .kw_def, .kw_class, .kw_return, .kw_if, .kw_else, .kw_elif, .kw_while, .kw_for,
+        .kw_in, .kw_import, .kw_from, .kw_as, .kw_and, .kw_or, .kw_not, .kw_is,
+        .kw_None, .kw_True, .kw_False, .kw_pass, .kw_break, .kw_continue, .kw_try, .kw_except,
+        .kw_finally, .kw_raise, .kw_nonlocal, .kw_lambda, .kw_assert, .kw_async, .kw_await, .kw_del,
+        .kw_global, .kw_with, .kw_yield, .eof
     };
 
     for (expected) |t_type| {

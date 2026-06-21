@@ -175,8 +175,8 @@ fn list_repr(self: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
 // --- Dict Object ---
 pub const PyDictEntry = extern struct {
     hash: i64,
-    key: *PyObject,
-    value: *PyObject,
+    key: ?*PyObject,
+    value: ?*PyObject,
 };
 
 pub const PyDictObject = extern struct {
@@ -233,7 +233,7 @@ pub const PyDictObject = extern struct {
                 // deleted slot, continue probing
             } else {
                 const entry = &self.entries[@intCast(entry_idx)];
-                if (entry.hash == hash and try keysEqual(entry.key, key, mm)) {
+                if (entry.hash == hash and try keysEqual(entry.key.?, key, mm)) {
                     return idx;
                 }
             }
@@ -263,7 +263,7 @@ pub const PyDictObject = extern struct {
             // Existing key
             const entry = &self.entries[@intCast(entry_idx)];
             value.incRef();
-            entry.value.decRef(mm);
+            entry.value.?.decRef(mm);
             entry.value = value;
         }
     }
@@ -297,6 +297,30 @@ pub const PyDictObject = extern struct {
         return null;
     }
 
+    pub fn delItem(self: *PyDictObject, key: *PyObject, mm: *PyMemoryManager) !bool {
+        if (self.indices_size == 0) return false;
+        const hash = try hashObject(key);
+        if (try self.lookup(key, hash, mm)) |bucket_idx| {
+            const entry_idx = self.indices[bucket_idx];
+            if (entry_idx >= 0) {
+                // Mark index as deleted (tombstone)
+                self.indices[bucket_idx] = -2;
+                // DecRef the key and value
+                self.entries[@intCast(entry_idx)].key.?.decRef(mm);
+                self.entries[@intCast(entry_idx)].value.?.decRef(mm);
+                // Zero out the entry to prevent use-after-free during resize
+                self.entries[@intCast(entry_idx)] = .{
+                    .hash = 0,
+                    .key = null,
+                    .value = null,
+                };
+                self.active_count -= 1;
+                return true;
+            }
+        }
+        return false;
+    }
+
     fn resize(self: *PyDictObject, new_indices_size: usize, mm: *PyMemoryManager) !void {
         const new_indices_bytes = try mm.allocBytes(new_indices_size * @sizeOf(i32));
         const new_indices: [*]i32 = @ptrCast(@alignCast(new_indices_bytes.ptr));
@@ -311,9 +335,12 @@ pub const PyDictObject = extern struct {
         var new_entries_size: usize = 0;
         
         if (self.indices_size > 0) {
-            for (0..self.entries_size) |i| {
-                const entry = &self.entries[i];
-                // Check if key is not null
+            // Iterate over indices table to skip tombstoned (-2) and empty (-1) entries.
+            // This prevents use-after-free from deleted entries whose keys/values have been decRef'd.
+            for (0..self.indices_size) |bucket_i| {
+                const entry_idx = self.indices[bucket_i];
+                if (entry_idx < 0) continue; // skip empty or tombstoned
+                const entry = &self.entries[@intCast(entry_idx)];
                 new_entries[new_entries_size] = entry.*;
                 
                 const mask = new_indices_size - 1;
@@ -351,8 +378,8 @@ fn dict_dealloc(self: *PyObject, mm: *PyMemoryManager) void {
     if (obj.indices_size > 0) {
         for (0..obj.entries_size) |i| {
             const entry = &obj.entries[i];
-            entry.key.decRef(mm);
-            entry.value.decRef(mm);
+            if (entry.key) |k| k.decRef(mm);
+            if (entry.value) |v| v.decRef(mm);
         }
         mm.freeBytes(@as([*]u8, @ptrCast(obj.indices))[0..(obj.indices_size * @sizeOf(i32))]);
         mm.freeBytes(@as([*]u8, @ptrCast(obj.entries))[0..(obj.entries_capacity * @sizeOf(PyDictEntry))]);
@@ -371,14 +398,18 @@ fn dict_repr(self: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
     
     try writer.writeAll("{");
     var first = true;
-    for (0..obj.entries_size) |i| {
-        const entry = &obj.entries[i];
+    // Iterate over indices table to skip tombstoned entries
+    for (0..obj.indices_size) |i| {
+        const entry_idx = obj.indices[i];
+        if (entry_idx < 0) continue; // skip empty or tombstoned
+        const entry = &obj.entries[@intCast(entry_idx)];
+        
         if (!first) try writer.writeAll(", ");
         first = false;
         
-        const k_repr = try get_repr(entry.key, mm);
+        const k_repr = try get_repr(entry.key.?, mm);
         defer k_repr.decRef(mm);
-        const v_repr = try get_repr(entry.value, mm);
+        const v_repr = try get_repr(entry.value.?, mm);
         defer v_repr.decRef(mm);
         
         try writer.print("{s}: {s}", .{k_repr.as(PyStringObject).value(), v_repr.as(PyStringObject).value()});

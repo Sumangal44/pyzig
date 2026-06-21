@@ -11,6 +11,9 @@ pub const Opcode = enum(u8) {
     BINARY_SUB,
     BINARY_MUL,
     BINARY_DIV,
+    BINARY_MOD,
+    BINARY_POW,
+    BINARY_FLOOR_DIV,
     COMPARE_OP,
     PRINT_EXPR,
     RETURN_VALUE,
@@ -43,6 +46,22 @@ pub const Opcode = enum(u8) {
     CHECK_EXCEPTION,
     LOAD_FAST,
     STORE_FAST,
+    UNARY_NOT,
+    JUMP_IF_FALSE_OR_POP,
+    JUMP_IF_TRUE_OR_POP,
+    
+    // Phase 4 opcodes — full Python feature set
+    UNARY_NEG,
+    GET_ITER,
+    FOR_ITER,
+    BINARY_SUBSCR,
+    STORE_SUBSCR,
+    DELETE_NAME,
+    DELETE_FAST,
+    DELETE_SUBSCR,
+    DELETE_ATTR,
+    IS_OP,         // arg=0 for `is`, arg=1 for `is not`
+    CONTAINS_OP,   // arg=0 for `in`, arg=1 for `not in`
 };
 
 pub const Instruction = struct {

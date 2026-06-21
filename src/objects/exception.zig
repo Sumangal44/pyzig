@@ -8,10 +8,10 @@ pub const PyExceptionObject = extern struct {
     base: PyObject,
     message: *PyObject, // PyStringObject
     
-    pub fn create(message: *PyObject, mm: *PyMemoryManager) !*PyExceptionObject {
+    pub fn create(type_ptr: *const PyTypeObject, message: *PyObject, mm: *PyMemoryManager) !*PyExceptionObject {
         const obj = try mm.alloc(PyExceptionObject);
         obj.* = .{
-            .base = PyObject.init(&PyException_Type),
+            .base = PyObject.init(type_ptr),
             .message = message,
         };
         message.incRef();
@@ -38,3 +38,10 @@ fn exception_repr(self: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
     const repr_str = std.fmt.bufPrint(&buf, "Exception: {s}", .{obj.message.as(PyStringObject).value()}) catch "Exception";
     return try PyStringObject.create(repr_str, mm);
 }
+
+pub const PyAssertionError_Type = PyTypeObject{
+    .name = "AssertionError",
+    .tp_dealloc = exception_dealloc,
+    .tp_repr = exception_repr,
+    .tp_str = exception_repr,
+};

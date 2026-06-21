@@ -29,10 +29,14 @@ pub const Compiler = struct {
     consts: std.ArrayList(*PyObject),
     names: std.ArrayList([]const u8),
     nonlocals: std.StringHashMap(void),
+    globals_set: std.StringHashMap(void),
     locals: std.StringHashMap(void),
     varnames: std.ArrayList([]const u8),
     is_function: bool = false,
     parent: ?*Compiler = null,
+    // Loop context for break/continue
+    loop_start_stack: std.ArrayList(usize),
+    loop_break_patches: std.ArrayList(std.ArrayList(usize)),
 
     pub fn init(allocator: std.mem.Allocator, mm: *PyMemoryManager) Compiler {
         return .{
@@ -42,10 +46,13 @@ pub const Compiler = struct {
             .consts = std.ArrayList(*PyObject).empty,
             .names = std.ArrayList([]const u8).empty,
             .nonlocals = std.StringHashMap(void).init(allocator),
+            .globals_set = std.StringHashMap(void).init(allocator),
             .locals = std.StringHashMap(void).init(allocator),
             .varnames = std.ArrayList([]const u8).empty,
             .is_function = false,
             .parent = null,
+            .loop_start_stack = std.ArrayList(usize).empty,
+            .loop_break_patches = std.ArrayList(std.ArrayList(usize)).empty,
         };
     }
 
@@ -64,7 +71,13 @@ pub const Compiler = struct {
         }
         self.varnames.deinit(self.allocator);
         self.nonlocals.deinit();
+        self.globals_set.deinit();
         self.locals.deinit();
+        self.loop_start_stack.deinit(self.allocator);
+        for (self.loop_break_patches.items) |*bp| {
+            bp.deinit(self.allocator);
+        }
+        self.loop_break_patches.deinit(self.allocator);
     }
 
     fn addVarname(self: *Compiler, name: []const u8) !u16 {
@@ -79,6 +92,12 @@ pub const Compiler = struct {
     }
 
     fn emitStore(self: *Compiler, name: []const u8) anyerror!void {
+        // If marked as global, always use STORE_NAME (global scope)
+        if (self.is_function and self.globals_set.contains(name)) {
+            const name_idx = try self.addName(name);
+            try self.instructions.append(self.allocator, .{ .op = .STORE_NAME, .arg = name_idx });
+            return;
+        }
         if (self.nonlocals.contains(name) or try self.checkEnclosingScope(name)) {
             const name_idx = try self.addName(name);
             try self.instructions.append(self.allocator, .{ .op = .STORE_DEREF, .arg = name_idx });
@@ -92,6 +111,12 @@ pub const Compiler = struct {
     }
 
     fn emitLoad(self: *Compiler, name: []const u8) anyerror!void {
+        // If marked as global, always use LOAD_NAME (global scope)
+        if (self.is_function and self.globals_set.contains(name)) {
+            const name_idx = try self.addName(name);
+            try self.instructions.append(self.allocator, .{ .op = .LOAD_NAME, .arg = name_idx });
+            return;
+        }
         if (self.nonlocals.contains(name) or try self.checkEnclosingScope(name)) {
             const name_idx = try self.addName(name);
             try self.instructions.append(self.allocator, .{ .op = .LOAD_DEREF, .arg = name_idx });
@@ -104,20 +129,49 @@ pub const Compiler = struct {
         }
     }
 
+    fn emitDelete(self: *Compiler, target: *const AST) anyerror!void {
+        switch (target.*) {
+            .Name => |name| {
+                if (self.is_function and self.locals.contains(name)) {
+                    const var_idx = try self.addVarname(name);
+                    try self.instructions.append(self.allocator, .{ .op = .DELETE_FAST, .arg = var_idx });
+                } else {
+                    const name_idx = try self.addName(name);
+                    try self.instructions.append(self.allocator, .{ .op = .DELETE_NAME, .arg = name_idx });
+                }
+            },
+            .Subscript => |sub| {
+                try self.compileAST(sub.value);
+                try self.compileAST(sub.index);
+                try self.instructions.append(self.allocator, .{ .op = .DELETE_SUBSCR });
+            },
+            .Attribute => |attr| {
+                try self.compileAST(attr.value);
+                const attr_idx = try self.addName(attr.attr);
+                try self.instructions.append(self.allocator, .{ .op = .DELETE_ATTR, .arg = attr_idx });
+            },
+            else => {
+                return error.SyntaxError;
+            },
+        }
+    }
+
     fn addConst(self: *Compiler, obj: *PyObject) !u16 {
         for (self.consts.items, 0..) |item, i| {
-            if (item.type_obj == obj.type_obj) {
-                if (item.type_obj == &PyInt_Type) {
+            const name = item.type_obj.name;
+            const obj_name = obj.type_obj.name;
+            if (std.mem.eql(u8, name, obj_name)) {
+                if (std.mem.eql(u8, name, "int")) {
                     if (item.as(PyIntObject).value == obj.as(PyIntObject).value) {
                         obj.decRef(self.mm);
                         return @intCast(i);
                     }
-                } else if (item.type_obj == &PyFloat_Type) {
+                } else if (std.mem.eql(u8, name, "float")) {
                     if (item.as(PyFloatObject).value == obj.as(PyFloatObject).value) {
                         obj.decRef(self.mm);
                         return @intCast(i);
                     }
-                } else if (item.type_obj == &PyString_Type) {
+                } else if (std.mem.eql(u8, name, "str")) {
                     if (std.mem.eql(u8, item.as(PyStringObject).value(), obj.as(PyStringObject).value())) {
                         obj.decRef(self.mm);
                         return @intCast(i);
@@ -149,13 +203,26 @@ pub const Compiler = struct {
         for (body) |stmt| {
             switch (stmt) {
                 .Assign => |assign| {
-                    try self.locals.put(assign.target, {});
+                    if (!self.globals_set.contains(assign.target)) {
+                        try self.locals.put(assign.target, {});
+                    }
+                },
+                .AugAssign => |aug| {
+                    if (!self.globals_set.contains(aug.target)) {
+                        try self.locals.put(aug.target, {});
+                    }
                 },
                 .FunctionDef => |func| {
                     try self.locals.put(func.name, {});
                 },
                 .ClassDef => |class_def| {
                     try self.locals.put(class_def.name, {});
+                },
+                .For => |for_node| {
+                    if (!self.globals_set.contains(for_node.target)) {
+                        try self.locals.put(for_node.target, {});
+                    }
+                    try self.preScanLocals(for_node.body);
                 },
                 .Try => |try_node| {
                     try self.preScanLocals(try_node.body);
@@ -173,6 +240,11 @@ pub const Compiler = struct {
                 },
                 .While => |while_node| {
                     try self.preScanLocals(while_node.body);
+                },
+                .Global => |global_node| {
+                    for (global_node.names) |name| {
+                        try self.globals_set.put(name, {});
+                    }
                 },
                 else => {},
             }
@@ -200,6 +272,42 @@ pub const Compiler = struct {
         return false;
     }
 
+    fn processEscapes(self: *Compiler, input: []const u8) ![]const u8 {
+        // Check if there are any escape sequences
+        var has_escape = false;
+        for (input) |ch| {
+            if (ch == '\\') {
+                has_escape = true;
+                break;
+            }
+        }
+        if (!has_escape) return input;
+
+        var result = std.ArrayList(u8).empty;
+        defer result.deinit(self.allocator);
+        
+        var i: usize = 0;
+        while (i < input.len) {
+            if (input[i] == '\\' and i + 1 < input.len) {
+                const next = input[i + 1];
+                switch (next) {
+                    'n' => { try result.append(self.allocator, '\n'); i += 2; },
+                    't' => { try result.append(self.allocator, '\t'); i += 2; },
+                    'r' => { try result.append(self.allocator, '\r'); i += 2; },
+                    '\\' => { try result.append(self.allocator, '\\'); i += 2; },
+                    '\'' => { try result.append(self.allocator, '\''); i += 2; },
+                    '"' => { try result.append(self.allocator, '"'); i += 2; },
+                    '0' => { try result.append(self.allocator, 0); i += 2; },
+                    else => { try result.append(self.allocator, '\\'); try result.append(self.allocator, next); i += 2; },
+                }
+            } else {
+                try result.append(self.allocator, input[i]);
+                i += 1;
+            }
+        }
+        return try self.allocator.dupe(u8, result.items);
+    }
+
     fn compileAST(self: *Compiler, node: *const AST) anyerror!void {
         switch (node.*) {
             .Module => |mod| {
@@ -211,6 +319,21 @@ pub const Compiler = struct {
                 try self.compileAST(assign.value);
                 try self.emitStore(assign.target);
             },
+            .AugAssign => |aug| {
+                try self.emitLoad(aug.target);
+                try self.compileAST(aug.value);
+                const op = switch (aug.op) {
+                    .Add => Opcode.BINARY_ADD,
+                    .Sub => Opcode.BINARY_SUB,
+                    .Mul => Opcode.BINARY_MUL,
+                    .Div => Opcode.BINARY_DIV,
+                    .Mod => Opcode.BINARY_MOD,
+                    .Pow => Opcode.BINARY_POW,
+                    .FloorDiv => Opcode.BINARY_FLOOR_DIV,
+                };
+                try self.instructions.append(self.allocator, .{ .op = op });
+                try self.emitStore(aug.target);
+            },
             .BinOp => |binop| {
                 try self.compileAST(binop.left);
                 try self.compileAST(binop.right);
@@ -219,13 +342,22 @@ pub const Compiler = struct {
                     .Sub => Opcode.BINARY_SUB,
                     .Mul => Opcode.BINARY_MUL,
                     .Div => Opcode.BINARY_DIV,
+                    .Mod => Opcode.BINARY_MOD,
+                    .Pow => Opcode.BINARY_POW,
+                    .FloorDiv => Opcode.BINARY_FLOOR_DIV,
                 };
                 try self.instructions.append(self.allocator, .{ .op = op });
             },
             .Compare => |cmp| {
                 try self.compileAST(cmp.left);
                 try self.compileAST(cmp.right);
-                try self.instructions.append(self.allocator, .{ .op = .COMPARE_OP, .arg = @intFromEnum(cmp.op) });
+                switch (cmp.op) {
+                    .Is => try self.instructions.append(self.allocator, .{ .op = .IS_OP, .arg = 0 }),
+                    .IsNot => try self.instructions.append(self.allocator, .{ .op = .IS_OP, .arg = 1 }),
+                    .In => try self.instructions.append(self.allocator, .{ .op = .CONTAINS_OP, .arg = 0 }),
+                    .NotIn => try self.instructions.append(self.allocator, .{ .op = .CONTAINS_OP, .arg = 1 }),
+                    else => try self.instructions.append(self.allocator, .{ .op = .COMPARE_OP, .arg = @intFromEnum(cmp.op) }),
+                }
             },
             .Constant => |val| {
                 const obj = switch (val) {
@@ -239,8 +371,11 @@ pub const Compiler = struct {
                         break :blk o;
                     },
                     .Int => |i| try PyIntObject.create(i, self.mm),
-                    .Float => |f| try PyFloatObject.create(f, self.mm),
-                    .String => |s| try PyStringObject.create(s, self.mm),
+                    .Float => |f_val| try PyFloatObject.create(f_val, self.mm),
+                    .String => |s| blk: {
+                        const processed = try self.processEscapes(s);
+                        break :blk try PyStringObject.create(processed, self.mm);
+                    },
                 };
                 const const_idx = try self.addConst(obj);
                 try self.instructions.append(self.allocator, .{ .op = .LOAD_CONST, .arg = const_idx });
@@ -273,6 +408,12 @@ pub const Compiler = struct {
             },
             .While => |while_node| {
                 const loop_start = self.instructions.items.len;
+                
+                // Push loop context
+                try self.loop_start_stack.append(self.allocator, loop_start);
+                var break_patches = std.ArrayList(usize).empty;
+                try self.loop_break_patches.append(self.allocator, break_patches);
+                
                 try self.compileAST(while_node.cond);
                 const jump_false_idx = self.instructions.items.len;
                 try self.instructions.append(self.allocator, .{ .op = .POP_JUMP_IF_FALSE, .arg = 0 });
@@ -281,6 +422,71 @@ pub const Compiler = struct {
                 }
                 try self.instructions.append(self.allocator, .{ .op = .JUMP_BACKWARD, .arg = @intCast(loop_start) });
                 self.instructions.items[jump_false_idx].arg = @intCast(self.instructions.items.len);
+                
+                // Patch break jumps
+                break_patches = self.loop_break_patches.pop().?;
+                for (break_patches.items) |bp| {
+                    self.instructions.items[bp].arg = @intCast(self.instructions.items.len);
+                }
+                break_patches.deinit(self.allocator);
+                _ = self.loop_start_stack.pop().?;
+            },
+            .For => |for_node| {
+                // Compile the iterable expression
+                try self.compileAST(for_node.iter);
+                // GET_ITER: convert to iterator
+                try self.instructions.append(self.allocator, .{ .op = .GET_ITER });
+                
+                const loop_start = self.instructions.items.len;
+                
+                // Push loop context
+                try self.loop_start_stack.append(self.allocator, loop_start);
+                var break_patches = std.ArrayList(usize).empty;
+                try self.loop_break_patches.append(self.allocator, break_patches);
+                
+                // FOR_ITER: get next item or jump to end
+                const for_iter_idx = self.instructions.items.len;
+                try self.instructions.append(self.allocator, .{ .op = .FOR_ITER, .arg = 0 });
+                
+                // Store the loop variable
+                try self.emitStore(for_node.target);
+                
+                // Compile loop body
+                for (for_node.body) |*stmt| {
+                    try self.compileAST(stmt);
+                }
+                
+                // Jump back to FOR_ITER
+                try self.instructions.append(self.allocator, .{ .op = .JUMP_BACKWARD, .arg = @intCast(loop_start) });
+                
+                // Patch FOR_ITER jump target
+                self.instructions.items[for_iter_idx].arg = @intCast(self.instructions.items.len);
+                
+                // Pop the iterator (exhausted)
+                try self.instructions.append(self.allocator, .{ .op = .POP_TOP });
+                
+                // Patch break jumps
+                break_patches = self.loop_break_patches.pop().?;
+                for (break_patches.items) |bp| {
+                    self.instructions.items[bp].arg = @intCast(self.instructions.items.len);
+                }
+                break_patches.deinit(self.allocator);
+                _ = self.loop_start_stack.pop().?;
+            },
+            .Break => {
+                if (self.loop_break_patches.items.len == 0) {
+                    return error.SyntaxError; // break outside loop
+                }
+                const bp_idx = self.instructions.items.len;
+                try self.instructions.append(self.allocator, .{ .op = .JUMP_FORWARD, .arg = 0 });
+                try self.loop_break_patches.items[self.loop_break_patches.items.len - 1].append(self.allocator, bp_idx);
+            },
+            .Continue => {
+                if (self.loop_start_stack.items.len == 0) {
+                    return error.SyntaxError; // continue outside loop
+                }
+                const loop_start = self.loop_start_stack.items[self.loop_start_stack.items.len - 1];
+                try self.instructions.append(self.allocator, .{ .op = .JUMP_BACKWARD, .arg = @intCast(loop_start) });
             },
             .List => |list_node| {
                 for (list_node.elts) |*elt| {
@@ -354,6 +560,46 @@ pub const Compiler = struct {
                 try self.instructions.append(self.allocator, .{ .op = .LOAD_CONST, .arg = const_idx });
                 try self.instructions.append(self.allocator, .{ .op = .MAKE_FUNCTION });
                 try self.emitStore(func_def.name);
+            },
+            .Lambda => |lambda_node| {
+                var child_compiler = Compiler.init(self.mm.allocator, self.mm);
+                child_compiler.parent = self;
+                child_compiler.is_function = true;
+                defer child_compiler.deinit();
+                
+                for (lambda_node.args) |arg| {
+                    try child_compiler.varnames.append(child_compiler.allocator, try child_compiler.allocator.dupe(u8, arg));
+                    try child_compiler.locals.put(arg, {});
+                }
+                
+                // Lambda body is a single expression — compile and return
+                try child_compiler.compileAST(lambda_node.body);
+                try child_compiler.instructions.append(child_compiler.allocator, .{ .op = .RETURN_VALUE });
+                
+                const code_obj = try self.mm.allocator.create(PyCodeObject);
+                errdefer self.mm.allocator.destroy(code_obj);
+                
+                var child_varnames = try self.mm.allocator.alloc([]const u8, child_compiler.varnames.items.len);
+                errdefer {
+                    for (child_varnames) |name| self.mm.allocator.free(name);
+                    self.mm.allocator.free(child_varnames);
+                }
+                for (child_compiler.varnames.items, 0..) |vname, i| {
+                    child_varnames[i] = try self.mm.allocator.dupe(u8, vname);
+                }
+                
+                code_obj.* = PyCodeObject{
+                    .instructions = try child_compiler.instructions.toOwnedSlice(self.mm.allocator),
+                    .consts = try child_compiler.consts.toOwnedSlice(self.mm.allocator),
+                    .names = try child_compiler.names.toOwnedSlice(self.mm.allocator),
+                    .argcount = lambda_node.args.len,
+                    .varnames = child_varnames,
+                };
+                
+                const wrapper_obj = try PyCodeObjectWrapper.create(code_obj, self.mm);
+                const const_idx = try self.addConst(wrapper_obj);
+                try self.instructions.append(self.allocator, .{ .op = .LOAD_CONST, .arg = const_idx });
+                try self.instructions.append(self.allocator, .{ .op = .MAKE_FUNCTION });
             },
             .Return => |ret| {
                 if (ret.value) |val| {
@@ -431,6 +677,17 @@ pub const Compiler = struct {
                 try self.compileAST(assign_attr.value);
                 const attr_idx = try self.addName(assign_attr.attr);
                 try self.instructions.append(self.allocator, .{ .op = .STORE_ATTR, .arg = attr_idx });
+            },
+            .Subscript => |sub| {
+                try self.compileAST(sub.value);
+                try self.compileAST(sub.index);
+                try self.instructions.append(self.allocator, .{ .op = .BINARY_SUBSCR });
+            },
+            .AssignSubscript => |asub| {
+                try self.compileAST(asub.expr);
+                try self.compileAST(asub.value);
+                try self.compileAST(asub.index);
+                try self.instructions.append(self.allocator, .{ .op = .STORE_SUBSCR });
             },
             .Try => |try_node| {
                 const has_finally = try_node.finalbody.len > 0;
@@ -536,6 +793,33 @@ pub const Compiler = struct {
                     try self.nonlocals.put(name, {});
                 }
             },
+            .Global => |global_node| {
+                for (global_node.names) |name| {
+                    try self.globals_set.put(name, {});
+                }
+            },
+            .Assert => |assert_node| {
+                // Compile: if not test_expr: raise AssertionError(msg)
+                try self.compileAST(assert_node.test_expr);
+                const jump_idx = self.instructions.items.len;
+                try self.instructions.append(self.allocator, .{ .op = .POP_JUMP_IF_TRUE, .arg = 0 });
+                
+                // Load AssertionError and call it
+                const exc_idx = try self.addName("AssertionError");
+                try self.instructions.append(self.allocator, .{ .op = .LOAD_NAME, .arg = exc_idx });
+                if (assert_node.msg) |msg| {
+                    try self.compileAST(msg);
+                    try self.instructions.append(self.allocator, .{ .op = .CALL, .arg = 1 });
+                } else {
+                    try self.instructions.append(self.allocator, .{ .op = .CALL, .arg = 0 });
+                }
+                try self.instructions.append(self.allocator, .{ .op = .RAISE_VARARGS, .arg = 1 });
+                
+                self.instructions.items[jump_idx].arg = @intCast(self.instructions.items.len);
+            },
+            .Del => |del_node| {
+                try self.emitDelete(del_node.target);
+            },
             .Import => |import_node| {
                 for (import_node.names) |name| {
                     const name_idx = try self.addName(name);
@@ -552,6 +836,25 @@ pub const Compiler = struct {
                     try self.emitStore(name);
                 }
                 try self.instructions.append(self.allocator, .{ .op = .POP_TOP });
+            },
+            .LogicalOp => |logop| {
+                try self.compileAST(logop.left);
+                const jump_idx = self.instructions.items.len;
+                const op = switch (logop.op) {
+                    .And => Opcode.JUMP_IF_FALSE_OR_POP,
+                    .Or => Opcode.JUMP_IF_TRUE_OR_POP,
+                };
+                try self.instructions.append(self.allocator, .{ .op = op, .arg = 0 });
+                try self.compileAST(logop.right);
+                self.instructions.items[jump_idx].arg = @intCast(self.instructions.items.len);
+            },
+            .UnaryOp => |unop| {
+                try self.compileAST(unop.operand);
+                const op = switch (unop.op) {
+                    .Not => Opcode.UNARY_NOT,
+                    .Neg => Opcode.UNARY_NEG,
+                };
+                try self.instructions.append(self.allocator, .{ .op = op });
             },
         }
     }
@@ -571,6 +874,10 @@ pub const Compiler = struct {
             },
             .Assign => |assign| {
                 try self.resolveScopesAST(assign.value);
+            },
+            .AugAssign => |aug| {
+                _ = try self.checkEnclosingScope(aug.target);
+                try self.resolveScopesAST(aug.value);
             },
             .BinOp => |binop| {
                 try self.resolveScopesAST(binop.left);
@@ -602,6 +909,13 @@ pub const Compiler = struct {
                     try self.resolveScopesAST(stmt);
                 }
             },
+            .For => |for_node| {
+                try self.resolveScopesAST(for_node.iter);
+                for (for_node.body) |*stmt| {
+                    try self.resolveScopesAST(stmt);
+                }
+            },
+            .Break, .Continue => {},
             .List => |list_node| {
                 for (list_node.elts) |*elt| {
                     try self.resolveScopesAST(elt);
@@ -630,6 +944,9 @@ pub const Compiler = struct {
                 try child_compiler.preScanLocals(func_def.body);
                 try child_compiler.resolveFunctionScopes(func_def.body);
             },
+            .Lambda => |lambda_node| {
+                try self.resolveScopesAST(lambda_node.body);
+            },
             .Return => |ret| {
                 if (ret.value) |val| {
                     try self.resolveScopesAST(val);
@@ -657,6 +974,15 @@ pub const Compiler = struct {
                 try self.resolveScopesAST(assign_attr.expr);
                 try self.resolveScopesAST(assign_attr.value);
             },
+            .Subscript => |sub| {
+                try self.resolveScopesAST(sub.value);
+                try self.resolveScopesAST(sub.index);
+            },
+            .AssignSubscript => |asub| {
+                try self.resolveScopesAST(asub.value);
+                try self.resolveScopesAST(asub.index);
+                try self.resolveScopesAST(asub.expr);
+            },
             .Try => |try_node| {
                 for (try_node.body) |*stmt| {
                     try self.resolveScopesAST(stmt);
@@ -680,9 +1006,30 @@ pub const Compiler = struct {
                     try self.nonlocals.put(name, {});
                 }
             },
+            .Global => |global_node| {
+                for (global_node.names) |name| {
+                    try self.globals_set.put(name, {});
+                }
+            },
+            .Assert => |assert_node| {
+                try self.resolveScopesAST(assert_node.test_expr);
+                if (assert_node.msg) |msg| {
+                    try self.resolveScopesAST(msg);
+                }
+            },
+            .Del => |del_node| {
+                try self.resolveScopesAST(del_node.target);
+            },
             .Import => {},
             .ImportFrom => {},
             .Pass => {},
+            .LogicalOp => |logop| {
+                try self.resolveScopesAST(logop.left);
+                try self.resolveScopesAST(logop.right);
+            },
+            .UnaryOp => |unop| {
+                try self.resolveScopesAST(unop.operand);
+            },
         }
     }
 
