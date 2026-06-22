@@ -175,6 +175,7 @@ pub const VM = struct {
     globals: std.StringHashMap(*PyObject),
     stdout_writer: *std.Io.Writer,
     last_result: ?*PyObject = null,
+    suppress_exception_handling: bool = false,
     io: std.Io,
 
     fn buildClass(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
@@ -533,8 +534,103 @@ pub const VM = struct {
             if (std.mem.eql(u8, name, "append")) {
                 const builtin_func = try PyBuiltinFunctionObject.create("append", builtins.listAppendMethod, self.mm);
                 method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "insert")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("insert", builtins.listInsertMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "pop")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("pop", builtins.listPopMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "remove")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("remove", builtins.listRemoveMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "index")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("index", builtins.listIndexMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "count")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("count", builtins.listCountMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "reverse")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("reverse", builtins.listReverseMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "sort")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("sort", builtins.listSortMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "extend")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("extend", builtins.listExtendMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "clear")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("clear", builtins.listClearMethod, self.mm);
+                method_func = &builtin_func.base;
             } else {
                 std.debug.print("AttributeError: 'list' object has no attribute '{s}'\n", .{name});
+                return error.AttributeError;
+            }
+            const bound = try PyMethodObject.create(inst, method_func, self.mm);
+            method_func.decRef(self.mm);
+            return &bound.base;
+        } else if (std.mem.eql(u8, inst.type_obj.name, "dict")) {
+            const builtins = @import("../stdlib/builtins.zig");
+            var method_func: *PyObject = undefined;
+            if (std.mem.eql(u8, name, "keys")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("keys", builtins.dictKeysMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "values")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("values", builtins.dictValuesMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "items")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("items", builtins.dictItemsMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "get")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("get", builtins.dictGetMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "pop")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("pop", builtins.dictPopMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "update")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("update", builtins.dictUpdateMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "clear")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("clear", builtins.dictClearMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "copy")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("copy", builtins.dictCopyMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else {
+                std.debug.print("AttributeError: 'dict' object has no attribute '{s}'\n", .{name});
+                return error.AttributeError;
+            }
+            const bound = try PyMethodObject.create(inst, method_func, self.mm);
+            method_func.decRef(self.mm);
+            return &bound.base;
+        } else if (std.mem.eql(u8, inst.type_obj.name, "str")) {
+            const builtins = @import("../stdlib/builtins.zig");
+            var method_func: *PyObject = undefined;
+            if (std.mem.eql(u8, name, "split")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("split", builtins.stringSplitMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "join")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("join", builtins.stringJoinMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "replace")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("replace", builtins.stringReplaceMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "strip")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("strip", builtins.stringStripMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "lower")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("lower", builtins.stringLowerMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "upper")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("upper", builtins.stringUpperMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "startswith")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("startswith", builtins.stringStartsWithMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "endswith")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("endswith", builtins.stringEndsWithMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else {
+                std.debug.print("AttributeError: 'str' object has no attribute '{s}'\n", .{name});
                 return error.AttributeError;
             }
             const bound = try PyMethodObject.create(inst, method_func, self.mm);
@@ -573,7 +669,7 @@ pub const VM = struct {
         }
     }
 
-    fn callObject(self: *VM, callable: *PyObject, args: []*PyObject, init_instance: ?*PyObject) anyerror!void {
+    pub fn callObject(self: *VM, callable: *PyObject, args: []*PyObject, init_instance: ?*PyObject) anyerror!void {
         const f = &self.frames[self.frame_count - 1];
         if (std.mem.eql(u8, callable.type_obj.name, "function")) {
             const func = callable.as(PyFunctionObject);
@@ -777,6 +873,15 @@ pub const VM = struct {
     fn raiseException(self: *VM, exc: *PyObject) anyerror!void {
         exc.incRef();
         
+        if (self.suppress_exception_handling) {
+            self.suppress_exception_handling = false;
+            const f = &self.frames[self.frame_count - 1];
+            f.deinit(self.mm, self.allocator);
+            self.frame_count -= 1;
+            exc.decRef(self.mm);
+            return error.PythonException;
+        }
+        
         while (self.frame_count > 0) {
             const f = &self.frames[self.frame_count - 1];
             if (f.block_stack_top > 0) {
@@ -830,7 +935,9 @@ pub const VM = struct {
                         try self.runLoop(prev_frame_count);
                     }
                     
-                    const exit_res = f.pop();
+                    // __exit__ return value is in last_result (child frame returns into last_result)
+                    const exit_res = self.last_result orelse PyNone;
+                    exit_res.incRef();
                     defer exit_res.decRef(self.mm);
                     
                     var is_true = false;
@@ -846,6 +953,8 @@ pub const VM = struct {
                         f.push(PyNone);
                         return;
                     }
+                    // Not suppressed: re-raise, continue searching for a handler
+                    continue;
                 } else {
                     while (f.stack_top > block.stack_level) {
                         f.stack_top -= 1;
@@ -1274,10 +1383,35 @@ pub const VM = struct {
                             }
                             
                             if (found_cell == null) {
+                                // Check current frame's fastlocals (function args)
+                                const f_varnames = f.code.varnames;
+                                for (f_varnames, 0..) |vname, vi| {
+                                    if (std.mem.eql(u8, vname, name)) {
+                                        if (f.fastlocals[vi]) |val| {
+                                            const cell = try PyCellObject.create(val, self.mm);
+                                            val.decRef(self.mm);
+                                            f.fastlocals[vi] = &cell.base;
+                                            const g = try locals.getOrPut(name);
+                                            if (!g.found_existing) {
+                                                g.key_ptr.* = try self.allocator.dupe(u8, name);
+                                            } else {
+                                                g.value_ptr.*.decRef(self.mm);
+                                            }
+                                            g.value_ptr.* = &cell.base;
+                                            cell.base.incRef();
+                                            found_cell = &cell.base;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            if (found_cell == null) {
                                 var idx = self.frame_count - 1;
                                 while (idx > 0) {
                                     idx -= 1;
                                     const pf = &self.frames[idx];
+                                    // Check locals hashmap
                                     if (pf.locals.get(name)) |c| {
                                         if (std.mem.eql(u8, c.type_obj.name, "cell")) {
                                             found_cell = c;
@@ -1293,6 +1427,29 @@ pub const VM = struct {
                                         }
                                         break;
                                     }
+                                    // Check fastlocals too (function parameters)
+                                    const pf_varnames = pf.code.varnames;
+                                    for (pf_varnames, 0..) |vname, vi| {
+                                        if (std.mem.eql(u8, vname, name)) {
+                                            if (pf.fastlocals[vi]) |val| {
+                                                const cell = try PyCellObject.create(val, self.mm);
+                                                val.decRef(self.mm);
+                                                pf.fastlocals[vi] = &cell.base;
+                                                // Also put in locals so future lookups find it
+                                                const g = try pf.locals.getOrPut(name);
+                                                if (!g.found_existing) {
+                                                    g.key_ptr.* = try self.allocator.dupe(u8, name);
+                                                } else {
+                                                    g.value_ptr.*.decRef(self.mm);
+                                                }
+                                                g.value_ptr.* = &cell.base;
+                                                cell.base.incRef();
+                                                found_cell = &cell.base;
+                                            }
+                                            break;
+                                        }
+                                    }
+                                    if (found_cell != null) break;
                                 }
                             }
                             
@@ -1321,7 +1478,21 @@ pub const VM = struct {
                     f.ip = ip;
                     f.stack_top = stack_top;
                     
-                    try self.callObject(callable, args, null);
+                    if (self.callObject(callable, args, null)) {
+                        // success — fall through to frame refresh
+                    } else |err| {
+                        if (err == error.StopIteration) {
+                            const msg = try primitives.PyStringObject.create("", self.mm);
+                            const exc = try exception_mod.PyExceptionObject.create(
+                                &exception_mod.PyStopIteration_Type, msg, self.mm
+                            );
+                            try self.raiseException(&exc.base);
+                            exc.base.decRef(self.mm);
+                            msg.decRef(self.mm);
+                        } else {
+                            return err;
+                        }
+                    }
                     
                     frame_idx = self.frame_count - 1;
                     f = &self.frames[frame_idx];
@@ -1729,6 +1900,34 @@ pub const VM = struct {
                         push(f, &stack_top, &list.base);
                         const idx_obj = try primitives.PyIntObject.create(0, self.mm);
                         push(f, &stack_top, idx_obj);
+                    } else if (std.mem.eql(u8, name, "object")) {
+                        // User-defined instance — try __iter__ protocol
+                        const iter_method = self.loadAttribute(iterable, "__iter__") catch {
+                            std.debug.print("TypeError: '{s}' object is not iterable\n", .{iterable.as(PyInstanceObject).class_obj.name.as(PyStringObject).value()});
+                            return error.TypeError;
+                        };
+                        defer iter_method.decRef(self.mm);
+                        
+                        f.ip = ip;
+                        f.stack_top = stack_top;
+                        const prev_frame = self.frame_count;
+                        try self.callObject(iter_method, &.{}, null);
+                        if (self.frame_count > prev_frame) {
+                            self.suppress_exception_handling = true;
+                            defer self.suppress_exception_handling = false;
+                            try self.runLoop(prev_frame);
+                        }
+                        
+                        const iter_obj = self.last_result orelse return error.TypeError;
+                        self.last_result = null;
+                        
+                        frame_idx = self.frame_count - 1;
+                        f = &self.frames[frame_idx];
+                        stack_top = f.stack_top;
+                        
+                        push(f, &stack_top, iter_obj);
+                        PyNone.incRef();
+                        push(f, &stack_top, PyNone);
                     } else {
                         // Try if it's a range object (which is a list in our implementation)
                         iterable.incRef();
@@ -1748,8 +1947,7 @@ pub const VM = struct {
                     if (std.mem.eql(u8, iterable.type_obj.name, "generator")) {
                         const gen = iterable.as(function_mod.PyGeneratorObject);
                         if (gen.is_closed) {
-                            const g_obj = pop(f, &stack_top);
-                            g_obj.decRef(self.mm);
+                            // Leave generator on stack for POP_TOP to clean up
                             ip = instr.arg;
                         } else {
                             f.ip = ip - 1;
@@ -1773,6 +1971,44 @@ pub const VM = struct {
                             is_class_body = f.is_class_body;
                             func = f.func;
                         }
+                    } else if (@intFromPtr(idx_obj) == @intFromPtr(PyNone)) {
+                        // User-defined iterator — call __next__
+                        const next_method = self.loadAttribute(iterable, "__next__") catch {
+                            std.debug.print("StopIteration: iterator has no __next__\n", .{});
+                            return error.TypeError;
+                        };
+                        defer next_method.decRef(self.mm);
+                        
+                        f.ip = ip;
+                        f.stack_top = stack_top;
+                        const prev_frame = self.frame_count;
+                        try self.callObject(next_method, &.{}, null);
+                        if (self.frame_count > prev_frame) {
+                            self.suppress_exception_handling = true;
+                            defer self.suppress_exception_handling = false;
+                            self.runLoop(prev_frame) catch |err| {
+                                if (err == error.PythonException) {
+                                    // __next__ raised StopIteration (or any exception) — terminate loop
+                                    _ = pop(f, &stack_top); // remove iterator
+                                    stack_top = f.stack_top;
+                                    ip = instr.arg;
+                                    continue;
+                                }
+                                return err;
+                            };
+                        }
+                        
+                        // __next__ returned normally
+                        const val = self.last_result orelse return error.TypeError;
+                        self.last_result = null;
+                        
+                        frame_idx = self.frame_count - 1;
+                        f = &self.frames[frame_idx];
+                        stack_top = f.stack_top;
+                        
+                        PyNone.incRef();
+                        push(f, &stack_top, PyNone);
+                        push(f, &stack_top, val);
                     } else {
                         const idx = idx_obj.as(primitives.PyIntObject).value;
                         const name = iterable.type_obj.name;
@@ -2262,7 +2498,10 @@ pub const VM = struct {
                     is_class_body = f.is_class_body;
                     func = f.func;
 
-                    if (instructions[ip].op == .FOR_ITER) {
+                    if (ip < instructions.len and instructions[ip].op == .FOR_ITER) {
+                        // Advance past FOR_ITER — the yielded value is the loop item
+                        ip += 1;
+                        // Push a dummy index for FOR_ITER to pop on the next iteration
                         const dummy = try primitives.PyIntObject.create(0, self.mm);
                         push(f, &stack_top, dummy);
                     }

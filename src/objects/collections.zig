@@ -54,6 +54,7 @@ pub const PyTuple_Type = PyTypeObject{
     .tp_dealloc = tuple_dealloc,
     .tp_repr = tuple_repr,
     .tp_str = tuple_repr,
+    .tp_richcompare = tuple_richcompare,
 };
 
 fn tuple_dealloc(self: *PyObject, mm: *PyMemoryManager) void {
@@ -112,23 +113,158 @@ pub const PyListObject = extern struct {
     }
 
     pub fn append(self: *PyListObject, item: *PyObject, mm: *PyMemoryManager) !void {
-        if (self.size >= self.capacity) {
-            const new_capacity = if (self.capacity == 0) 4 else self.capacity * 2;
-            const new_bytes = try mm.allocBytes(new_capacity * @sizeOf(*PyObject));
-            const new_items: [*]*PyObject = @ptrCast(@alignCast(new_bytes.ptr));
-            
-            if (self.size > 0) {
-                if (self.items) |items| {
-                    @memcpy(new_items[0..self.size], items[0..self.size]);
-                    mm.freeBytes(@as([*]u8, @ptrCast(items))[0..(self.capacity * @sizeOf(*PyObject))]);
-                }
-            }
-            self.items = new_items;
-            self.capacity = new_capacity;
-        }
+        try self.ensureCapacity(self.size + 1, mm);
         item.incRef();
         self.items.?[self.size] = item;
         self.size += 1;
+    }
+
+    pub fn ensureCapacity(self: *PyListObject, needed: usize, mm: *PyMemoryManager) !void {
+        if (needed <= self.capacity) return;
+        const new_capacity = @max(if (self.capacity == 0) 4 else self.capacity * 2, needed);
+        const new_bytes = try mm.allocBytes(new_capacity * @sizeOf(*PyObject));
+        const new_items: [*]*PyObject = @ptrCast(@alignCast(new_bytes.ptr));
+        if (self.size > 0) {
+            if (self.items) |items| {
+                @memcpy(new_items[0..self.size], items[0..self.size]);
+                mm.freeBytes(@as([*]u8, @ptrCast(items))[0..(self.capacity * @sizeOf(*PyObject))]);
+            }
+        }
+        self.items = new_items;
+        self.capacity = new_capacity;
+    }
+
+    pub fn insert(self: *PyListObject, idx: i64, item: *PyObject, mm: *PyMemoryManager) !void {
+        const len = @as(i64, @intCast(self.size));
+        var pos = idx;
+        if (pos < 0) pos = @max(len + pos, 0);
+        if (pos > len) pos = len;
+        const pos_u = @as(usize, @intCast(pos));
+        try self.ensureCapacity(self.size + 1, mm);
+        if (pos_u < self.size) {
+            std.mem.copyBackwards(*PyObject, self.items.?[pos_u + 1 .. self.size + 1], self.items.?[pos_u..self.size]);
+        }
+        item.incRef();
+        self.items.?[pos_u] = item;
+        self.size += 1;
+    }
+
+    pub fn pop(self: *PyListObject, idx: ?i64) *PyObject {
+        const actual = if (idx) |i| i else @as(i64, @intCast(@as(isize, @intCast(self.size - 1))));
+        const pos = if (actual < 0) @as(i64, @intCast(self.size)) + actual else actual;
+        const pos_u = @as(usize, @intCast(pos));
+        const item = self.items.?[pos_u];
+        if (pos_u < self.size - 1) {
+            std.mem.copyForwards(*PyObject, self.items.?[pos_u..self.size], self.items.?[pos_u + 1 .. self.size]);
+        }
+        self.size -= 1;
+        return item;
+    }
+
+    pub fn remove(self: *PyListObject, item: *PyObject, mm: *PyMemoryManager) !void {
+        for (0..self.size) |i| {
+            if (try elementsEqual(self.items.?[i], item, mm)) {
+                self.items.?[i].decRef(mm);
+                if (i < self.size - 1) {
+                    std.mem.copyForwards(*PyObject, self.items.?[i..self.size], self.items.?[i + 1 .. self.size]);
+                }
+                self.size -= 1;
+                return;
+            }
+        }
+        return error.ValueError;
+    }
+
+    pub fn index(self: *PyListObject, item: *PyObject, mm: *PyMemoryManager) !i64 {
+        for (0..self.size) |i| {
+            if (try elementsEqual(self.items.?[i], item, mm)) {
+                return @as(i64, @intCast(i));
+            }
+        }
+        return error.ValueError;
+    }
+
+    pub fn count(self: *PyListObject, item: *PyObject, mm: *PyMemoryManager) !i64 {
+        var cnt: i64 = 0;
+        for (0..self.size) |i| {
+            if (try elementsEqual(self.items.?[i], item, mm)) {
+                cnt += 1;
+            }
+        }
+        return cnt;
+    }
+
+    pub fn reverse(self: *PyListObject) void {
+        if (self.size == 0) return;
+        var i: usize = 0;
+        var j: usize = self.size - 1;
+        while (i < j) {
+            const tmp = self.items.?[i];
+            self.items.?[i] = self.items.?[j];
+            self.items.?[j] = tmp;
+            i += 1;
+            j -= 1;
+        }
+    }
+
+    pub fn sort(self: *PyListObject, mm: *PyMemoryManager) !void {
+        if (self.size <= 1) return;
+        for (1..self.size) |i| {
+            const key = self.items.?[i];
+            var j = i;
+            while (j > 0) {
+                if (self.items.?[j - 1].type_obj.tp_richcompare) |cmp_fn| {
+                    const res = try cmp_fn(self.items.?[j - 1], key, .Gt, mm);
+                    if (res == PyTrue) {
+                        self.items.?[j] = self.items.?[j - 1];
+                        j -= 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    return error.TypeError;
+                }
+            }
+            self.items.?[j] = key;
+        }
+    }
+
+    pub fn extend(self: *PyListObject, iterable: *PyObject, mm: *PyMemoryManager) !void {
+        if (std.mem.eql(u8, iterable.type_obj.name, "list")) {
+            const other = iterable.as(PyListObject);
+            const new_size = self.size + other.size;
+            try self.ensureCapacity(new_size, mm);
+            if (other.items) |other_items| {
+                @memcpy(self.items.?[self.size..new_size], other_items[0..other.size]);
+                for (0..other.size) |i| {
+                    other_items[i].incRef();
+                }
+            }
+            self.size = new_size;
+            return;
+        }
+        if (std.mem.eql(u8, iterable.type_obj.name, "tuple")) {
+            const other = iterable.as(PyTupleObject);
+            const other_items = other.items();
+            const new_size = self.size + other_items.len;
+            try self.ensureCapacity(new_size, mm);
+            @memcpy(self.items.?[self.size..new_size], other_items);
+            for (other_items) |item| {
+                item.incRef();
+            }
+            self.size = new_size;
+            return;
+        }
+        return error.TypeError;
+    }
+
+    pub fn clear(self: *PyListObject, mm: *PyMemoryManager) void {
+        if (self.items) |items| {
+            for (0..self.size) |i| {
+                items[i].decRef(mm);
+            }
+        }
+        self.size = 0;
     }
 };
 
@@ -137,6 +273,7 @@ pub const PyList_Type = PyTypeObject{
     .tp_dealloc = list_dealloc,
     .tp_repr = list_repr,
     .tp_str = list_repr,
+    .tp_richcompare = list_richcompare,
 };
 
 fn list_dealloc(self: *PyObject, mm: *PyMemoryManager) void {
@@ -171,6 +308,88 @@ fn list_repr(self: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
     }
     try writer.writeAll("]");
     return try PyStringObject.create(alloc_writer.written(), mm);
+}
+
+fn elementsEqual(a: *PyObject, b: *PyObject, mm: *PyMemoryManager) !bool {
+    if (a == b) return true;
+    if (a.type_obj.tp_richcompare) |cmp_fn| {
+        const res = try cmp_fn(a, b, .Eq, mm);
+        defer res.decRef(mm);
+        return res == PyTrue;
+    }
+    return false;
+}
+
+fn list_richcompare(self: *PyObject, other: *PyObject, op: CompareOp, mm: *PyMemoryManager) anyerror!*PyObject {
+    const other_name = other.type_obj.name;
+    if (!std.mem.eql(u8, other_name, "list")) {
+        if (op == .Eq) return PyFalse;
+        if (op == .Ne) return PyTrue;
+        return error.TypeError;
+    }
+    const self_list = self.as(PyListObject);
+    const other_list = other.as(PyListObject);
+
+    const self_items = if (self_list.items) |items| items[0..self_list.size] else &[_]*PyObject{};
+    const other_items = if (other_list.items) |items| items[0..other_list.size] else &[_]*PyObject{};
+
+    const min_len = @min(self_items.len, other_items.len);
+    for (0..min_len) |i| {
+        if (!try elementsEqual(self_items[i], other_items[i], mm)) {
+            if (op == .Eq) return PyFalse;
+            if (op == .Ne) return PyTrue;
+            if (self_items[i].type_obj.tp_richcompare) |cmp_fn| {
+                return try cmp_fn(self_items[i], other_items[i], op, mm);
+            }
+            return error.TypeError;
+        }
+    }
+
+    const result = switch (op) {
+        .Lt => self_items.len < other_items.len,
+        .Le => self_items.len <= other_items.len,
+        .Eq => self_items.len == other_items.len,
+        .Ne => self_items.len != other_items.len,
+        .Gt => self_items.len > other_items.len,
+        .Ge => self_items.len >= other_items.len,
+    };
+    return if (result) PyTrue else PyFalse;
+}
+
+fn tuple_richcompare(self: *PyObject, other: *PyObject, op: CompareOp, mm: *PyMemoryManager) anyerror!*PyObject {
+    const other_name = other.type_obj.name;
+    if (!std.mem.eql(u8, other_name, "tuple")) {
+        if (op == .Eq) return PyFalse;
+        if (op == .Ne) return PyTrue;
+        return error.TypeError;
+    }
+    const self_tuple = self.as(PyTupleObject);
+    const other_tuple = other.as(PyTupleObject);
+
+    const self_items = self_tuple.items();
+    const other_items = other_tuple.items();
+
+    const min_len = @min(self_items.len, other_items.len);
+    for (0..min_len) |i| {
+        if (!try elementsEqual(self_items[i], other_items[i], mm)) {
+            if (op == .Eq) return PyFalse;
+            if (op == .Ne) return PyTrue;
+            if (self_items[i].type_obj.tp_richcompare) |cmp_fn| {
+                return try cmp_fn(self_items[i], other_items[i], op, mm);
+            }
+            return error.TypeError;
+        }
+    }
+
+    const result = switch (op) {
+        .Lt => self_items.len < other_items.len,
+        .Le => self_items.len <= other_items.len,
+        .Eq => self_items.len == other_items.len,
+        .Ne => self_items.len != other_items.len,
+        .Gt => self_items.len > other_items.len,
+        .Ge => self_items.len >= other_items.len,
+    };
+    return if (result) PyTrue else PyFalse;
 }
 
 // --- Dict Object ---
@@ -364,6 +583,106 @@ pub const PyDictObject = extern struct {
         self.entries = new_entries;
         self.entries_capacity = new_entries_capacity;
         self.entries_size = new_entries_size;
+    }
+
+    pub fn keys(self: *PyDictObject, mm: *PyMemoryManager) !*PyListObject {
+        const result = try PyListObject.create(self.active_count, mm);
+        for (0..self.indices_size) |i| {
+            const entry_idx = self.indices[i];
+            if (entry_idx < 0) continue;
+            try result.append(self.entries[@intCast(entry_idx)].key.?, mm);
+        }
+        return result;
+    }
+
+    pub fn values(self: *PyDictObject, mm: *PyMemoryManager) !*PyListObject {
+        const result = try PyListObject.create(self.active_count, mm);
+        for (0..self.indices_size) |i| {
+            const entry_idx = self.indices[i];
+            if (entry_idx < 0) continue;
+            try result.append(self.entries[@intCast(entry_idx)].value.?, mm);
+        }
+        return result;
+    }
+
+    pub fn items(self: *PyDictObject, mm: *PyMemoryManager) !*PyListObject {
+        const result = try PyListObject.create(self.active_count, mm);
+        for (0..self.indices_size) |i| {
+            const entry_idx = self.indices[i];
+            if (entry_idx < 0) continue;
+            const entry = &self.entries[@intCast(entry_idx)];
+            const tup = try PyTupleObject.create(2, mm);
+            tup.items()[0] = entry.key.?;
+            entry.key.?.incRef();
+            tup.items()[1] = entry.value.?;
+            entry.value.?.incRef();
+            try result.append(&tup.base, mm);
+        }
+        return result;
+    }
+
+    pub fn get(self: *PyDictObject, key: *PyObject, mm: *PyMemoryManager) ?*PyObject {
+        if (self.indices_size == 0) return null;
+        const hash = hashObject(key) catch return null;
+        if (self.lookup(key, hash, mm) catch null) |bucket_idx| {
+            const entry_idx = self.indices[bucket_idx];
+            if (entry_idx >= 0) {
+                return self.entries[@intCast(entry_idx)].value;
+            }
+        }
+        return null;
+    }
+
+    pub fn dictPop(self: *PyDictObject, key: *PyObject, mm: *PyMemoryManager) !*PyObject {
+        if (self.indices_size == 0) return error.KeyError;
+        const hash = try hashObject(key);
+        if (try self.lookup(key, hash, mm)) |bucket_idx| {
+            const entry_idx = self.indices[bucket_idx];
+            if (entry_idx >= 0) {
+                const value = self.entries[@intCast(entry_idx)].value.?;
+                value.incRef();
+                _ = try self.delItem(key, mm);
+                return value;
+            }
+        }
+        return error.KeyError;
+    }
+
+    pub fn update(self: *PyDictObject, other: *PyDictObject, mm: *PyMemoryManager) !void {
+        for (0..other.indices_size) |i| {
+            const entry_idx = other.indices[i];
+            if (entry_idx < 0) continue;
+            const entry = &other.entries[@intCast(entry_idx)];
+            try self.setItem(entry.key.?, entry.value.?, mm);
+        }
+    }
+
+    pub fn clear(self: *PyDictObject, mm: *PyMemoryManager) void {
+        for (0..self.indices_size) |i| {
+            const entry_idx = self.indices[i];
+            if (entry_idx < 0) continue;
+            self.entries[@intCast(entry_idx)].key.?.decRef(mm);
+            self.entries[@intCast(entry_idx)].value.?.decRef(mm);
+            self.entries[@intCast(entry_idx)] = .{
+                .hash = 0,
+                .key = null,
+                .value = null,
+            };
+            self.indices[i] = -1;
+        }
+        self.active_count = 0;
+        self.entries_size = 0;
+    }
+
+    pub fn copy(self: *PyDictObject, mm: *PyMemoryManager) !*PyDictObject {
+        const result = try PyDictObject.create(mm);
+        for (0..self.indices_size) |i| {
+            const entry_idx = self.indices[i];
+            if (entry_idx < 0) continue;
+            const entry = &self.entries[@intCast(entry_idx)];
+            try result.setItem(entry.key.?, entry.value.?, mm);
+        }
+        return result;
     }
 };
 

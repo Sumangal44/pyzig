@@ -271,6 +271,9 @@ pub const Compiler = struct {
                 try self.preScanExpr(log.left);
                 try self.preScanExpr(log.right);
             },
+            .Expr => |e| {
+                try self.preScanExpr(e.value);
+            },
             else => {},
         }
     }
@@ -763,6 +766,10 @@ pub const Compiler = struct {
                     try self.compileAST(arg);
                 }
                 try self.instructions.append(self.allocator, .{ .op = .CALL, .arg = @intCast(call_node.args.len) });
+            },
+            .Expr => |expr_node| {
+                try self.compileAST(expr_node.value);
+                try self.instructions.append(self.allocator, .{ .op = .POP_TOP });
             },
             .Pass => {},
             .ClassDef => |class_def| {
@@ -1269,6 +1276,9 @@ pub const Compiler = struct {
             },
             .Await => |a| {
                 try self.resolveScopesAST(a.value);
+            },
+            .Expr => |e| {
+                try self.resolveScopesAST(e.value);
             },
         }
     }

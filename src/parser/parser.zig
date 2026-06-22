@@ -490,7 +490,8 @@ pub const Parser = struct {
         }
 
         // Otherwise, it's just an expression statement
-        return try self.parseExpression();
+        const expr = try self.parseExpression();
+        return AST{ .Expr = .{ .value = try self.builder.newAST(expr) } };
     }
 
     fn parseExpression(self: *Parser) anyerror!AST {
@@ -1237,12 +1238,17 @@ test "parser simple module, print and math" {
                 else => return error.TestFailed,
             }
 
-            // Check print
+            // Check print (wrapped in Expr expression statement)
             switch (mod.body[1]) {
-                .Call => |call| {
-                    try testing.expectEqualStrings("print", call.func.*.Name);
-                    try testing.expectEqual(@as(usize, 1), call.args.len);
-                    try testing.expectEqualStrings("x", call.args[0].Name);
+                .Expr => |expr_node| {
+                    switch (expr_node.value.*) {
+                        .Call => |call| {
+                            try testing.expectEqualStrings("print", call.func.*.Name);
+                            try testing.expectEqual(@as(usize, 1), call.args.len);
+                            try testing.expectEqualStrings("x", call.args[0].Name);
+                        },
+                        else => return error.TestFailed,
+                    }
                 },
                 else => return error.TestFailed,
             }

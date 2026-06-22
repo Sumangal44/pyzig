@@ -117,6 +117,9 @@ pub const AST = union(enum) {
     Tuple: struct {
         elts: []AST,
     },
+    Expr: struct {
+        value: *AST,
+    },
     Dict: struct {
         keys: []AST,
         values: []AST,

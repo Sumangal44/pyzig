@@ -1284,6 +1284,439 @@ pub fn listAppendMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyOb
     return PyNone;
 }
 
+pub fn listInsertMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 3) return error.TypeError;
+    const self_obj = args[0];
+    const index = args[1];
+    const item = args[2];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    if (!std.mem.eql(u8, index.type_obj.name, "int")) return error.TypeError;
+    try self_obj.as(collections.PyListObject).insert(index.as(PyIntObject).value, item, vm.mm);
+    PyNone.incRef();
+    return PyNone;
+}
+
+pub fn listPopMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    _ = vm;
+    if (args.len < 1 or args.len > 2) return error.TypeError;
+    const self_obj = args[0];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    const self = self_obj.as(collections.PyListObject);
+    if (self.size == 0) return error.IndexError;
+    const index: ?i64 = if (args.len == 2) blk: {
+        if (!std.mem.eql(u8, args[1].type_obj.name, "int")) return error.TypeError;
+        break :blk args[1].as(PyIntObject).value;
+    } else null;
+    return self.pop(index);
+}
+
+pub fn listRemoveMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 2) return error.TypeError;
+    const self_obj = args[0];
+    const item = args[1];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    try self_obj.as(collections.PyListObject).remove(item, vm.mm);
+    PyNone.incRef();
+    return PyNone;
+}
+
+pub fn listIndexMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 2) return error.TypeError;
+    const self_obj = args[0];
+    const item = args[1];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    const idx = try self_obj.as(collections.PyListObject).index(item, vm.mm);
+    return try PyIntObject.create(idx, vm.mm);
+}
+
+pub fn listCountMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 2) return error.TypeError;
+    const self_obj = args[0];
+    const item = args[1];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    const cnt = try self_obj.as(collections.PyListObject).count(item, vm.mm);
+    return try PyIntObject.create(cnt, vm.mm);
+}
+
+pub fn listReverseMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    _ = vm;
+    if (args.len != 1) return error.TypeError;
+    const self_obj = args[0];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    self_obj.as(collections.PyListObject).reverse();
+    PyNone.incRef();
+    return PyNone;
+}
+
+pub fn listSortMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 1) return error.TypeError;
+    const self_obj = args[0];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    try self_obj.as(collections.PyListObject).sort(vm.mm);
+    PyNone.incRef();
+    return PyNone;
+}
+
+pub fn listExtendMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 2) return error.TypeError;
+    const self_obj = args[0];
+    const iterable = args[1];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    try self_obj.as(collections.PyListObject).extend(iterable, vm.mm);
+    PyNone.incRef();
+    return PyNone;
+}
+
+pub fn listClearMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 1) return error.TypeError;
+    const self_obj = args[0];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    self_obj.as(collections.PyListObject).clear(vm.mm);
+    PyNone.incRef();
+    return PyNone;
+}
+
+pub fn dictKeysMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 1) return error.TypeError;
+    const self_obj = args[0];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "dict")) return error.TypeError;
+    const result = try self_obj.as(collections.PyDictObject).keys(vm.mm);
+    return &result.base;
+}
+
+pub fn dictValuesMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 1) return error.TypeError;
+    const self_obj = args[0];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "dict")) return error.TypeError;
+    const result = try self_obj.as(collections.PyDictObject).values(vm.mm);
+    return &result.base;
+}
+
+pub fn dictItemsMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 1) return error.TypeError;
+    const self_obj = args[0];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "dict")) return error.TypeError;
+    const result = try self_obj.as(collections.PyDictObject).items(vm.mm);
+    return &result.base;
+}
+
+pub fn dictGetMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len < 2 or args.len > 3) return error.TypeError;
+    const self_obj = args[0];
+    const key = args[1];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "dict")) return error.TypeError;
+    if (self_obj.as(collections.PyDictObject).get(key, vm.mm)) |val| {
+        val.incRef();
+        return val;
+    }
+    if (args.len == 3) {
+        args[2].incRef();
+        return args[2];
+    }
+    PyNone.incRef();
+    return PyNone;
+}
+
+pub fn dictPopMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len < 2 or args.len > 3) return error.TypeError;
+    const self_obj = args[0];
+    const key = args[1];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "dict")) return error.TypeError;
+    const result = self_obj.as(collections.PyDictObject).dictPop(key, vm.mm) catch |err| {
+        if (err == error.KeyError and args.len == 3) {
+            args[2].incRef();
+            return args[2];
+        }
+        return err;
+    };
+    return result;
+}
+
+pub fn dictUpdateMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 2) return error.TypeError;
+    const self_obj = args[0];
+    const other = args[1];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "dict")) return error.TypeError;
+    if (!std.mem.eql(u8, other.type_obj.name, "dict")) return error.TypeError;
+    try self_obj.as(collections.PyDictObject).update(other.as(collections.PyDictObject), vm.mm);
+    PyNone.incRef();
+    return PyNone;
+}
+
+pub fn dictClearMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 1) return error.TypeError;
+    const self_obj = args[0];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "dict")) return error.TypeError;
+    self_obj.as(collections.PyDictObject).clear(vm.mm);
+    PyNone.incRef();
+    return PyNone;
+}
+
+pub fn dictCopyMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 1) return error.TypeError;
+    const self_obj = args[0];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "dict")) return error.TypeError;
+    const result = try self_obj.as(collections.PyDictObject).copy(vm.mm);
+    return &result.base;
+}
+
+pub fn stringSplitMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len < 1 or args.len > 2) return error.TypeError;
+    const self_obj = args[0];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "str")) return error.TypeError;
+    const self = self_obj.as(PyStringObject);
+    const s = self.value();
+
+    const result = try PyListObject.create(0, vm.mm);
+    if (args.len == 2) {
+        const sep_obj = args[1];
+        if (!std.mem.eql(u8, sep_obj.type_obj.name, "str")) return error.TypeError;
+        const sep_str = sep_obj.as(PyStringObject).value();
+        if (sep_str.len == 0) return error.ValueError;
+        var start: usize = 0;
+        while (std.mem.indexOf(u8, s[start..], sep_str)) |pos| {
+            const part = s[start..][0..pos];
+            const str_obj = try PyStringObject.create(part, vm.mm);
+            try result.append(str_obj, vm.mm);
+            str_obj.decRef(vm.mm);
+            start += pos + sep_str.len;
+        }
+        const last = s[start..];
+        const str_obj = try PyStringObject.create(last, vm.mm);
+        try result.append(str_obj, vm.mm);
+        str_obj.decRef(vm.mm);
+    } else {
+        var start: usize = 0;
+        while (start < s.len and std.ascii.isWhitespace(s[start])) {
+            start += 1;
+        }
+        while (start < s.len) {
+            var end = start;
+            while (end < s.len and !std.ascii.isWhitespace(s[end])) {
+                end += 1;
+            }
+            const part = s[start..end];
+            const str_obj = try PyStringObject.create(part, vm.mm);
+            try result.append(str_obj, vm.mm);
+            str_obj.decRef(vm.mm);
+            start = end;
+            while (start < s.len and std.ascii.isWhitespace(s[start])) {
+                start += 1;
+            }
+        }
+    }
+    return &result.base;
+}
+
+pub fn stringJoinMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 2) return error.TypeError;
+    const self_obj = args[0];
+    const iterable = args[1];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "str")) return error.TypeError;
+    if (!std.mem.eql(u8, iterable.type_obj.name, "list")) return error.TypeError;
+    const self = self_obj.as(PyStringObject);
+    const sep = self.value();
+    const lst = iterable.as(PyListObject);
+
+    const items = if (lst.items) |it| it[0..lst.size] else &[_]*PyObject{};
+    var total_len: usize = 0;
+    for (items, 0..) |item, i| {
+        if (!std.mem.eql(u8, item.type_obj.name, "str")) return error.TypeError;
+        total_len += item.as(PyStringObject).len;
+        if (i < items.len - 1) total_len += sep.len;
+    }
+
+    const buf = try vm.mm.allocBytes(total_len);
+    var offset: usize = 0;
+    for (items, 0..) |item, i| {
+        const part = item.as(PyStringObject).value();
+        @memcpy(buf[offset..][0..part.len], part);
+        offset += part.len;
+        if (i < items.len - 1) {
+            @memcpy(buf[offset..][0..sep.len], sep);
+            offset += sep.len;
+        }
+    }
+    return try PyStringObject.create(buf, vm.mm);
+}
+
+pub fn stringReplaceMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len < 3 or args.len > 4) return error.TypeError;
+    const self_obj = args[0];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "str")) return error.TypeError;
+    const old_obj = args[1];
+    const new_obj = args[2];
+    if (!std.mem.eql(u8, old_obj.type_obj.name, "str")) return error.TypeError;
+    if (!std.mem.eql(u8, new_obj.type_obj.name, "str")) return error.TypeError;
+    const self = self_obj.as(PyStringObject);
+    const s = self.value();
+    const old_str = old_obj.as(PyStringObject).value();
+    const new_str = new_obj.as(PyStringObject).value();
+    const count: usize = if (args.len == 4) blk: {
+        if (!std.mem.eql(u8, args[3].type_obj.name, "int")) return error.TypeError;
+        const c = args[3].as(PyIntObject).value;
+        break :blk if (c < 0) std.math.maxInt(usize) else @intCast(c);
+    } else std.math.maxInt(usize);
+
+    if (old_str.len == 0) return error.ValueError;
+
+    var alloc_writer = std.Io.Writer.Allocating.init(vm.mm.allocator);
+    defer alloc_writer.deinit();
+    const writer = &alloc_writer.writer;
+
+    var remaining = count;
+    var start: usize = 0;
+    while (remaining > 0) {
+        if (std.mem.indexOf(u8, s[start..], old_str)) |pos| {
+            try writer.writeAll(s[start..][0..pos]);
+            try writer.writeAll(new_str);
+            start += pos + old_str.len;
+            remaining -= 1;
+        } else {
+            break;
+        }
+    }
+    try writer.writeAll(s[start..]);
+    return try PyStringObject.create(alloc_writer.written(), vm.mm);
+}
+
+pub fn stringStripMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len < 1 or args.len > 2) return error.TypeError;
+    const self_obj = args[0];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "str")) return error.TypeError;
+    const self = self_obj.as(PyStringObject);
+    const s = self.value();
+
+    if (args.len == 2) {
+        const chars_obj = args[1];
+        if (!std.mem.eql(u8, chars_obj.type_obj.name, "str")) return error.TypeError;
+        const chars = chars_obj.as(PyStringObject).value();
+        const trimmed = std.mem.trim(u8, s, chars);
+        return try PyStringObject.create(trimmed, vm.mm);
+    } else {
+        var start: usize = 0;
+        while (start < s.len and std.ascii.isWhitespace(s[start])) {
+            start += 1;
+        }
+        if (start == s.len) return try PyStringObject.create("", vm.mm);
+        var end = s.len - 1;
+        while (end > start and std.ascii.isWhitespace(s[end])) {
+            end -= 1;
+        }
+        return try PyStringObject.create(s[start..end + 1], vm.mm);
+    }
+}
+
+pub fn stringLowerMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 1) return error.TypeError;
+    const self_obj = args[0];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "str")) return error.TypeError;
+    const self = self_obj.as(PyStringObject);
+    const s = self.value();
+
+    var alloc_writer = std.Io.Writer.Allocating.init(vm.mm.allocator);
+    defer alloc_writer.deinit();
+    const writer = &alloc_writer.writer;
+    for (s) |c| {
+        try writer.writeByte(std.ascii.toLower(c));
+    }
+    return try PyStringObject.create(alloc_writer.written(), vm.mm);
+}
+
+pub fn stringUpperMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 1) return error.TypeError;
+    const self_obj = args[0];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "str")) return error.TypeError;
+    const self = self_obj.as(PyStringObject);
+    const s = self.value();
+
+    var alloc_writer = std.Io.Writer.Allocating.init(vm.mm.allocator);
+    defer alloc_writer.deinit();
+    const writer = &alloc_writer.writer;
+    for (s) |c| {
+        try writer.writeByte(std.ascii.toUpper(c));
+    }
+    return try PyStringObject.create(alloc_writer.written(), vm.mm);
+}
+
+pub fn stringStartsWithMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    _ = vm;
+    if (args.len != 2) return error.TypeError;
+    const self_obj = args[0];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "str")) return error.TypeError;
+    const prefix_obj = args[1];
+    if (!std.mem.eql(u8, prefix_obj.type_obj.name, "str")) return error.TypeError;
+    const self = self_obj.as(PyStringObject);
+    const prefix = prefix_obj.as(PyStringObject).value();
+    const s = self.value();
+    if (prefix.len > s.len) return PyFalse;
+    return if (std.mem.eql(u8, s[0..prefix.len], prefix)) PyTrue else PyFalse;
+}
+
+pub fn stringEndsWithMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    _ = vm;
+    if (args.len != 2) return error.TypeError;
+    const self_obj = args[0];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "str")) return error.TypeError;
+    const suffix_obj = args[1];
+    if (!std.mem.eql(u8, suffix_obj.type_obj.name, "str")) return error.TypeError;
+    const self = self_obj.as(PyStringObject);
+    const suffix = suffix_obj.as(PyStringObject).value();
+    const s = self.value();
+    if (suffix.len > s.len) return PyFalse;
+    return if (std.mem.eql(u8, s[s.len - suffix.len ..], suffix)) PyTrue else PyFalse;
+}
+
 pub fn bytearrayAppendMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
     const VM = @import("../vm/vm.zig").VM;
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
@@ -1334,6 +1767,43 @@ pub fn builtinNext(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject 
         
         const caller_frame = &vm.frames[vm.frame_count - 1];
         return caller_frame.pop();
+    } else if (std.mem.eql(u8, iterable.type_obj.name, "object")) {
+        // User-defined iterator — call __next__
+        const next_method = vm.loadAttribute(iterable, "__next__") catch {
+            if (default_val) |dv| {
+                dv.incRef();
+                return dv;
+            }
+            return error.StopIteration;
+        };
+        defer next_method.decRef(vm.mm);
+        
+        const prev_frame_count = vm.frame_count;
+        try vm.callObject(next_method, &.{}, null);
+        if (vm.frame_count > prev_frame_count) {
+            vm.suppress_exception_handling = true;
+            defer vm.suppress_exception_handling = false;
+            vm.runLoop(prev_frame_count) catch |err| {
+                if (err == error.PythonException) {
+                    if (default_val) |dv| {
+                        dv.incRef();
+                        return dv;
+                    }
+                    return error.StopIteration;
+                }
+                return err;
+            };
+        }
+        
+        const result = vm.last_result orelse {
+            if (default_val) |dv| {
+                dv.incRef();
+                return dv;
+            }
+            return error.StopIteration;
+        };
+        vm.last_result = null;
+        return result;
     } else {
         return error.TypeError;
     }
