@@ -12,6 +12,7 @@ const PyIntObject = primitives.PyIntObject;
 const PyInt_Type = primitives.PyInt_Type;
 const PyFloat_Type = primitives.PyFloat_Type;
 const PyString_Type = primitives.PyString_Type;
+const CompareOp = @import("object.zig").CompareOp;
 
 // --- Helper for Repr ---
 fn get_repr(item: *PyObject, mm: *PyMemoryManager) !*PyObject {
@@ -485,4 +486,380 @@ test "dict basic functionality" {
     const retrieved = try dict.getItem(key, &mm);
     try testing.expect(retrieved != null);
     try testing.expectEqual(@as(i64, 100), retrieved.?.as(PyIntObject).value);
+}
+
+// --- Set and FrozenSet Opcodes and Types ---
+
+pub const PySetEntry = extern struct {
+    hash: i64,
+    key: ?*PyObject,
+};
+
+pub const PySetObject = extern struct {
+    base: PyObject,
+    indices: [*]i32,
+    indices_size: usize,
+    entries: [*]PySetEntry,
+    entries_size: usize,
+    entries_capacity: usize,
+    active_count: usize,
+
+    pub fn create(mm: *PyMemoryManager) !*PySetObject {
+        const obj = try mm.alloc(PySetObject);
+        obj.* = .{
+            .base = PyObject.init(&PySet_Type),
+            .indices = undefined,
+            .indices_size = 0,
+            .entries = undefined,
+            .entries_size = 0,
+            .entries_capacity = 0,
+            .active_count = 0,
+        };
+        return obj;
+    }
+
+    pub fn createFrozen(mm: *PyMemoryManager) !*PySetObject {
+        const obj = try mm.alloc(PySetObject);
+        obj.* = .{
+            .base = PyObject.init(&PyFrozenSet_Type),
+            .indices = undefined,
+            .indices_size = 0,
+            .entries = undefined,
+            .entries_size = 0,
+            .entries_capacity = 0,
+            .active_count = 0,
+        };
+        return obj;
+    }
+
+    fn hashObject(key: *PyObject) !i64 {
+        if (key.type_obj.tp_hash) |hash_fn| {
+            return try hash_fn(key);
+        }
+        return error.TypeError;
+    }
+
+    fn keysEqual(a: *PyObject, b: *PyObject, mm: *PyMemoryManager) !bool {
+        if (a == b) return true;
+        if (a.type_obj.tp_richcompare) |cmp_fn| {
+            const res = try cmp_fn(a, b, .Eq, mm);
+            defer res.decRef(mm);
+            return res == PyTrue;
+        }
+        return false;
+    }
+
+    fn lookup(self: *PySetObject, key: *PyObject, hash: i64, mm: *PyMemoryManager) !?usize {
+        if (self.indices_size == 0) return null;
+        const mask = self.indices_size - 1;
+        var idx = @as(usize, @truncate(@as(u64, @bitCast(hash)))) & mask;
+        var perturb = @as(u64, @bitCast(hash));
+        
+        while (true) {
+            const entry_idx = self.indices[idx];
+            if (entry_idx == -1) {
+                return idx;
+            } else if (entry_idx == -2) {
+                // deleted slot
+            } else {
+                const entry = &self.entries[@intCast(entry_idx)];
+                if (entry.hash == hash and try keysEqual(entry.key.?, key, mm)) {
+                    return idx;
+                }
+            }
+            idx = (idx * 5 + perturb + 1) & mask;
+            perturb >>= 5;
+        }
+    }
+
+    pub fn add(self: *PySetObject, key: *PyObject, mm: *PyMemoryManager) !void {
+        const hash = try hashObject(key);
+        if (self.indices_size == 0) {
+            try self.resize(8, mm);
+        }
+        
+        const lookup_res = (try self.lookup(key, hash, mm)).?;
+        const entry_idx = self.indices[lookup_res];
+        if (entry_idx < 0) {
+            if (self.entries_size >= self.entries_capacity) {
+                try self.resize(self.indices_size * 2, mm);
+                const new_res = (try self.lookup(key, hash, mm)).?;
+                try self.insertAt(new_res, key, hash, mm);
+            } else {
+                try self.insertAt(lookup_res, key, hash, mm);
+            }
+        }
+    }
+
+    fn insertAt(self: *PySetObject, bucket_idx: usize, key: *PyObject, hash: i64, mm: *PyMemoryManager) !void {
+        _ = mm;
+        const entry_idx = self.entries_size;
+        self.indices[bucket_idx] = @intCast(entry_idx);
+        
+        key.incRef();
+        
+        self.entries[entry_idx] = .{
+            .hash = hash,
+            .key = key,
+        };
+        self.entries_size += 1;
+        self.active_count += 1;
+    }
+
+    pub fn contains(self: *PySetObject, key: *PyObject, mm: *PyMemoryManager) !bool {
+        if (self.indices_size == 0) return false;
+        const hash = try hashObject(key);
+        if (try self.lookup(key, hash, mm)) |res| {
+            const entry_idx = self.indices[res];
+            return entry_idx >= 0;
+        }
+        return false;
+    }
+
+    pub fn remove(self: *PySetObject, key: *PyObject, mm: *PyMemoryManager) !bool {
+        if (self.indices_size == 0) return false;
+        const hash = try hashObject(key);
+        if (try self.lookup(key, hash, mm)) |bucket_idx| {
+            const entry_idx = self.indices[bucket_idx];
+            if (entry_idx >= 0) {
+                self.indices[bucket_idx] = -2;
+                self.entries[@intCast(entry_idx)].key.?.decRef(mm);
+                self.entries[@intCast(entry_idx)] = .{
+                    .hash = 0,
+                    .key = null,
+                };
+                self.active_count -= 1;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn resize(self: *PySetObject, new_indices_size: usize, mm: *PyMemoryManager) !void {
+        const new_indices_bytes = try mm.allocBytes(new_indices_size * @sizeOf(i32));
+        const new_indices: [*]i32 = @ptrCast(@alignCast(new_indices_bytes.ptr));
+        for (0..new_indices_size) |i| {
+            new_indices[i] = -1;
+        }
+
+        const new_entries_capacity = new_indices_size * 2 / 3;
+        const new_entries_bytes = try mm.allocBytes(new_entries_capacity * @sizeOf(PySetEntry));
+        const new_entries: [*]PySetEntry = @ptrCast(@alignCast(new_entries_bytes.ptr));
+        
+        var new_entries_size: usize = 0;
+        
+        if (self.indices_size > 0) {
+            for (0..self.indices_size) |bucket_i| {
+                const entry_idx = self.indices[bucket_i];
+                if (entry_idx < 0) continue;
+                const entry = &self.entries[@intCast(entry_idx)];
+                new_entries[new_entries_size] = entry.*;
+                
+                const mask = new_indices_size - 1;
+                var idx = @as(usize, @truncate(@as(u64, @bitCast(entry.hash)))) & mask;
+                var perturb = @as(u64, @bitCast(entry.hash));
+                while (new_indices[idx] != -1) {
+                    idx = (idx * 5 + perturb + 1) & mask;
+                    perturb >>= 5;
+                }
+                new_indices[idx] = @intCast(new_entries_size);
+                new_entries_size += 1;
+            }
+            
+            mm.freeBytes(@as([*]u8, @ptrCast(self.indices))[0..(self.indices_size * @sizeOf(i32))]);
+            mm.freeBytes(@as([*]u8, @ptrCast(self.entries))[0..(self.entries_capacity * @sizeOf(PySetEntry))]);
+        }
+        
+        self.indices = new_indices;
+        self.indices_size = new_indices_size;
+        self.entries = new_entries;
+        self.entries_capacity = new_entries_capacity;
+        self.entries_size = new_entries_size;
+    }
+};
+
+pub const PySet_Type = PyTypeObject{
+    .name = "set",
+    .tp_dealloc = set_dealloc,
+    .tp_repr = set_repr,
+    .tp_str = set_repr,
+    .tp_richcompare = set_richcompare,
+};
+
+pub const PyFrozenSet_Type = PyTypeObject{
+    .name = "frozenset",
+    .tp_dealloc = set_dealloc,
+    .tp_repr = frozenset_repr,
+    .tp_str = frozenset_repr,
+    .tp_richcompare = set_richcompare,
+    .tp_hash = frozenset_hash,
+};
+
+fn set_dealloc(self: *PyObject, mm: *PyMemoryManager) void {
+    const obj = self.as(PySetObject);
+    if (obj.indices_size > 0) {
+        for (0..obj.entries_size) |i| {
+            const entry = &obj.entries[i];
+            if (entry.key) |k| k.decRef(mm);
+        }
+        mm.freeBytes(@as([*]u8, @ptrCast(obj.indices))[0..(obj.indices_size * @sizeOf(i32))]);
+        mm.freeBytes(@as([*]u8, @ptrCast(obj.entries))[0..(obj.entries_capacity * @sizeOf(PySetEntry))]);
+    }
+    mm.free(PySetObject, obj);
+}
+
+fn set_repr(self: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
+    const obj = self.as(PySetObject);
+    if (obj.active_count == 0) {
+        return try PyStringObject.create("set()", mm);
+    }
+    var alloc_writer = std.Io.Writer.Allocating.init(mm.allocator);
+    defer alloc_writer.deinit();
+    const writer = &alloc_writer.writer;
+    
+    try writer.writeAll("{");
+    var first = true;
+    for (0..obj.indices_size) |i| {
+        const entry_idx = obj.indices[i];
+        if (entry_idx < 0) continue;
+        const entry = &obj.entries[@intCast(entry_idx)];
+        if (!first) try writer.writeAll(", ");
+        first = false;
+        
+        const k_repr = try get_repr(entry.key.?, mm);
+        defer k_repr.decRef(mm);
+        try writer.print("{s}", .{k_repr.as(PyStringObject).value()});
+    }
+    try writer.writeAll("}");
+    return try PyStringObject.create(alloc_writer.written(), mm);
+}
+
+fn frozenset_repr(self: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
+    const obj = self.as(PySetObject);
+    if (obj.active_count == 0) {
+        return try PyStringObject.create("frozenset()", mm);
+    }
+    var alloc_writer = std.Io.Writer.Allocating.init(mm.allocator);
+    defer alloc_writer.deinit();
+    const writer = &alloc_writer.writer;
+    
+    try writer.writeAll("frozenset({");
+    var first = true;
+    for (0..obj.indices_size) |i| {
+        const entry_idx = obj.indices[i];
+        if (entry_idx < 0) continue;
+        const entry = &obj.entries[@intCast(entry_idx)];
+        if (!first) try writer.writeAll(", ");
+        first = false;
+        
+        const k_repr = try get_repr(entry.key.?, mm);
+        defer k_repr.decRef(mm);
+        try writer.print("{s}", .{k_repr.as(PyStringObject).value()});
+    }
+    try writer.writeAll("})");
+    return try PyStringObject.create(alloc_writer.written(), mm);
+}
+
+fn set_richcompare(self: *PyObject, other: *PyObject, op: CompareOp, mm: *PyMemoryManager) anyerror!*PyObject {
+    const other_name = other.type_obj.name;
+    if (!std.mem.eql(u8, other_name, "set") and !std.mem.eql(u8, other_name, "frozenset")) {
+        if (op == .Eq) return PyFalse;
+        if (op == .Ne) return PyTrue;
+        return error.TypeError;
+    }
+    const self_set = self.as(PySetObject);
+    const other_set = other.as(PySetObject);
+    
+    var result = false;
+    switch (op) {
+        .Eq => {
+            if (self_set.active_count == other_set.active_count) {
+                result = true;
+                for (0..self_set.indices_size) |i| {
+                    const entry_idx = self_set.indices[i];
+                    if (entry_idx < 0) continue;
+                    const key = self_set.entries[@intCast(entry_idx)].key.?;
+                    if (!try other_set.contains(key, mm)) {
+                        result = false;
+                        break;
+                    }
+                }
+            }
+        },
+        .Ne => {
+            const eq_res = try set_richcompare(self, other, .Eq, mm);
+            defer eq_res.decRef(mm);
+            result = eq_res == PyFalse;
+        },
+        .Le => {
+            if (self_set.active_count <= other_set.active_count) {
+                result = true;
+                for (0..self_set.indices_size) |i| {
+                    const entry_idx = self_set.indices[i];
+                    if (entry_idx < 0) continue;
+                    const key = self_set.entries[@intCast(entry_idx)].key.?;
+                    if (!try other_set.contains(key, mm)) {
+                        result = false;
+                        break;
+                    }
+                }
+            }
+        },
+        .Lt => {
+            if (self_set.active_count < other_set.active_count) {
+                result = true;
+                for (0..self_set.indices_size) |i| {
+                    const entry_idx = self_set.indices[i];
+                    if (entry_idx < 0) continue;
+                    const key = self_set.entries[@intCast(entry_idx)].key.?;
+                    if (!try other_set.contains(key, mm)) {
+                        result = false;
+                        break;
+                    }
+                }
+            }
+        },
+        .Ge => {
+            return try set_richcompare(other, self, .Le, mm);
+        },
+        .Gt => {
+            return try set_richcompare(other, self, .Lt, mm);
+        },
+    }
+    return if (result) PyTrue else PyFalse;
+}
+
+fn frozenset_hash(self: *PyObject) anyerror!i64 {
+    const obj = self.as(PySetObject);
+    var hash_val: i64 = 0;
+    for (0..obj.indices_size) |i| {
+        const entry_idx = obj.indices[i];
+        if (entry_idx < 0) continue;
+        const key = obj.entries[@intCast(entry_idx)].key.?;
+        if (key.type_obj.tp_hash) |hash_fn| {
+            hash_val ^= try hash_fn(key);
+        } else {
+            return error.TypeError;
+        }
+    }
+    return hash_val;
+}
+
+test "set basic functionality" {
+    const allocator = testing.allocator;
+    var mm = PyMemoryManager.init(allocator);
+    defer mm.deinit();
+
+    const set = try PySetObject.create(&mm);
+    defer set.base.decRef(&mm);
+
+    const key = try PyStringObject.create("item", &mm);
+    defer key.decRef(&mm);
+
+    try set.add(key, &mm);
+    try testing.expect(try set.contains(key, &mm));
+
+    const removed = try set.remove(key, &mm);
+    try testing.expect(removed);
+    try testing.expect(!(try set.contains(key, &mm)));
 }

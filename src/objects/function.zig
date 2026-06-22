@@ -88,3 +88,45 @@ fn builtin_func_repr(self: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
     return try PyStringObject.create(repr_str, mm);
 }
 
+pub const PyGeneratorObject = struct {
+    base: PyObject,
+    frame: @import("../vm/vm.zig").PyFrameObject,
+    is_started: bool = false,
+    is_closed: bool = false,
+    
+    pub fn create(frame: @import("../vm/vm.zig").PyFrameObject, mm: *PyMemoryManager) !*PyGeneratorObject {
+        const obj = try mm.alloc(PyGeneratorObject);
+        obj.* = .{
+            .base = PyObject.init(&PyGenerator_Type),
+            .frame = frame,
+            .is_started = false,
+            .is_closed = false,
+        };
+        return obj;
+    }
+};
+
+pub const PyGenerator_Type = PyTypeObject{
+    .name = "generator",
+    .tp_dealloc = generator_dealloc,
+    .tp_repr = generator_repr,
+    .tp_str = generator_repr,
+};
+
+fn generator_dealloc(self: *PyObject, mm: *PyMemoryManager) void {
+    const obj = self.as(PyGeneratorObject);
+    if (!obj.is_closed) {
+        obj.frame.deinit(mm, mm.allocator);
+    }
+    mm.free(PyGeneratorObject, obj);
+}
+
+fn generator_repr(self: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
+    const obj = self.as(PyGeneratorObject);
+    const primitives = @import("primitives.zig");
+    const PyStringObject = primitives.PyStringObject;
+    var buf: [128]u8 = undefined;
+    const name = std.fmt.bufPrint(&buf, "<generator object at 0x{x}>", .{@intFromPtr(obj)}) catch "<generator>";
+    return try PyStringObject.create(name, mm);
+}
+

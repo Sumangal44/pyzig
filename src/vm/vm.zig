@@ -40,12 +40,14 @@ const PyCellObject = cell_mod.PyCellObject;
 pub const BlockType = enum {
     Finally,
     Except,
+    With,
 };
 
 pub const Block = struct {
     type: BlockType,
     handler: usize,
     stack_level: usize,
+    exit_func: ?*PyObject = null,
 };
 
 pub const StackHelper = struct {
@@ -78,6 +80,7 @@ pub const PyFrameObject = struct {
     init_instance: ?*PyObject = null,
     func: ?*PyFunctionObject = null,
     active_exception: ?*PyObject = null,
+    generator: ?*PyObject = null,
 
     pub fn init(allocator: std.mem.Allocator, code: *PyCodeObject, globals: *std.StringHashMap(*PyObject), is_module: bool) PyFrameObject {
         var fastlocals: []?*PyObject = &[_]?*PyObject{};
@@ -231,6 +234,38 @@ pub const VM = struct {
         name_copy = try self.allocator.dupe(u8, "AssertionError");
         try self.globals.put(name_copy, &wrapper.base);
 
+        wrapper = try @import("../stdlib/builtins.zig").PyTypeWrapper.create(&@import("../objects/exception.zig").PyTypeError_Type, self.mm);
+        name_copy = try self.allocator.dupe(u8, "TypeError");
+        try self.globals.put(name_copy, &wrapper.base);
+
+        wrapper = try @import("../stdlib/builtins.zig").PyTypeWrapper.create(&@import("../objects/exception.zig").PyValueError_Type, self.mm);
+        name_copy = try self.allocator.dupe(u8, "ValueError");
+        try self.globals.put(name_copy, &wrapper.base);
+
+        wrapper = try @import("../stdlib/builtins.zig").PyTypeWrapper.create(&@import("../objects/exception.zig").PyKeyError_Type, self.mm);
+        name_copy = try self.allocator.dupe(u8, "KeyError");
+        try self.globals.put(name_copy, &wrapper.base);
+
+        wrapper = try @import("../stdlib/builtins.zig").PyTypeWrapper.create(&@import("../objects/exception.zig").PyIndexError_Type, self.mm);
+        name_copy = try self.allocator.dupe(u8, "IndexError");
+        try self.globals.put(name_copy, &wrapper.base);
+
+        wrapper = try @import("../stdlib/builtins.zig").PyTypeWrapper.create(&@import("../objects/exception.zig").PyStopIteration_Type, self.mm);
+        name_copy = try self.allocator.dupe(u8, "StopIteration");
+        try self.globals.put(name_copy, &wrapper.base);
+
+        wrapper = try @import("../stdlib/builtins.zig").PyTypeWrapper.create(&@import("../objects/exception.zig").PyAttributeError_Type, self.mm);
+        name_copy = try self.allocator.dupe(u8, "AttributeError");
+        try self.globals.put(name_copy, &wrapper.base);
+
+        wrapper = try @import("../stdlib/builtins.zig").PyTypeWrapper.create(&@import("../objects/exception.zig").PyNameError_Type, self.mm);
+        name_copy = try self.allocator.dupe(u8, "NameError");
+        try self.globals.put(name_copy, &wrapper.base);
+
+        wrapper = try @import("../stdlib/builtins.zig").PyTypeWrapper.create(&@import("../objects/exception.zig").PyRuntimeError_Type, self.mm);
+        name_copy = try self.allocator.dupe(u8, "RuntimeError");
+        try self.globals.put(name_copy, &wrapper.base);
+
         wrapper = try @import("../stdlib/builtins.zig").PyTypeWrapper.create(&@import("../objects/class.zig").PyInstance_Type, self.mm);
         name_copy = try self.allocator.dupe(u8, "object");
         try self.globals.put(name_copy, &wrapper.base);
@@ -249,12 +284,14 @@ pub const VM = struct {
         const builtins = @import("../stdlib/builtins.zig");
         try vm.registerBuiltin("len", builtins.builtinLen);
         try vm.registerBuiltin("type", builtins.builtinType);
+        try vm.registerBuiltin("next", builtins.builtinNext);
         try vm.registerBuiltin("range", builtins.builtinRange);
         try vm.registerBuiltin("str", builtins.builtinStr);
         try vm.registerBuiltin("print", builtins.builtinPrint);
         try vm.registerBuiltin("input", builtins.builtinInput);
         try vm.registerBuiltin("int", builtins.builtinInt);
         try vm.registerBuiltin("float", builtins.builtinFloat);
+        try vm.registerBuiltin("complex", builtins.builtinComplex);
         try vm.registerBuiltin("bool", builtins.builtinBool);
         try vm.registerBuiltin("abs", builtins.builtinAbs);
         try vm.registerBuiltin("max", builtins.builtinMax);
@@ -263,6 +300,10 @@ pub const VM = struct {
         try vm.registerBuiltin("list", builtins.builtinList);
         try vm.registerBuiltin("tuple", builtins.builtinTuple);
         try vm.registerBuiltin("dict", builtins.builtinDict);
+        try vm.registerBuiltin("bytes", builtins.builtinBytes);
+        try vm.registerBuiltin("bytearray", builtins.builtinByteArray);
+        try vm.registerBuiltin("set", builtins.builtinSet);
+        try vm.registerBuiltin("frozenset", builtins.builtinFrozenSet);
         try vm.registerBuiltin("isinstance", builtins.builtinIsinstance);
         try vm.registerBuiltin("hasattr", builtins.builtinHasattr);
         try vm.registerBuiltin("getattr", builtins.builtinGetattr);
@@ -311,6 +352,24 @@ pub const VM = struct {
     fn popFrameAndPushResult(self: *VM, result: *PyObject, starting_frame_count: usize) void {
         var f = &self.frames[self.frame_count - 1];
         
+        if (f.generator) |gen_val| {
+            const gen = gen_val.as(function_mod.PyGeneratorObject);
+            gen.is_closed = true;
+            result.decRef(self.mm);
+            
+            f.deinit(self.mm, self.allocator);
+            self.frame_count -= 1;
+            
+            if (self.frame_count > starting_frame_count) {
+                const caller_f = &self.frames[self.frame_count - 1];
+                if (caller_f.code.instructions[caller_f.ip].op == .FOR_ITER) {
+                    const dummy = primitives.PyIntObject.create(0, self.mm) catch @panic("OOM");
+                    caller_f.push(dummy);
+                }
+            }
+            return;
+        }
+
         var actual_result = result;
         if (f.is_class_body) {
             result.decRef(self.mm);
@@ -449,6 +508,51 @@ pub const VM = struct {
             }
             std.debug.print("AttributeError: module '{s}' has no attribute '{s}'\n", .{module.name.as(PyStringObject).value(), name});
             return error.AttributeError;
+        } else if (std.mem.eql(u8, inst.type_obj.name, "set")) {
+            const builtins = @import("../stdlib/builtins.zig");
+            var method_func: *PyObject = undefined;
+            if (std.mem.eql(u8, name, "add")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("add", builtins.setAddMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "remove")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("remove", builtins.setRemoveMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "discard")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("discard", builtins.setDiscardMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else {
+                std.debug.print("AttributeError: 'set' object has no attribute '{s}'\n", .{name});
+                return error.AttributeError;
+            }
+            const bound = try PyMethodObject.create(inst, method_func, self.mm);
+            method_func.decRef(self.mm);
+            return &bound.base;
+        } else if (std.mem.eql(u8, inst.type_obj.name, "list")) {
+            const builtins = @import("../stdlib/builtins.zig");
+            var method_func: *PyObject = undefined;
+            if (std.mem.eql(u8, name, "append")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("append", builtins.listAppendMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else {
+                std.debug.print("AttributeError: 'list' object has no attribute '{s}'\n", .{name});
+                return error.AttributeError;
+            }
+            const bound = try PyMethodObject.create(inst, method_func, self.mm);
+            method_func.decRef(self.mm);
+            return &bound.base;
+        } else if (std.mem.eql(u8, inst.type_obj.name, "bytearray")) {
+            const builtins = @import("../stdlib/builtins.zig");
+            var method_func: *PyObject = undefined;
+            if (std.mem.eql(u8, name, "append")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("append", builtins.bytearrayAppendMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else {
+                std.debug.print("AttributeError: 'bytearray' object has no attribute '{s}'\n", .{name});
+                return error.AttributeError;
+            }
+            const bound = try PyMethodObject.create(inst, method_func, self.mm);
+            method_func.decRef(self.mm);
+            return &bound.base;
         } else {
             std.debug.print("TypeError: '{s}' object has no attributes\n", .{inst.type_obj.name});
             return error.TypeError;
@@ -484,6 +588,24 @@ pub const VM = struct {
                 return error.TypeError;
             }
             
+            if (func_code.is_generator) {
+                var child_frame = PyFrameObject.init(self.allocator, func_code, func.globals, false);
+                child_frame.func = func;
+                child_frame.init_instance = init_instance;
+                func.base.incRef();
+                if (init_instance) |ii| ii.incRef();
+                errdefer child_frame.deinit(self.mm, self.allocator);
+                
+                for (args, 0..) |arg_val, arg_idx| {
+                    child_frame.fastlocals[arg_idx] = arg_val;
+                }
+                
+                const gen_obj = try function_mod.PyGeneratorObject.create(child_frame, self.mm);
+                gen_obj.frame.generator = &gen_obj.base;
+                f.push(&gen_obj.base);
+                return;
+            }
+
             if (self.frame_count >= 64) {
                 for (args) |arg| {
                     arg.decRef(self.mm);
@@ -578,6 +700,80 @@ pub const VM = struct {
         }
     }
 
+    fn setIntersection(self: *VM, a: *PyObject, b: *PyObject) anyerror!*PyObject {
+        const is_frozen = std.mem.eql(u8, a.type_obj.name, "frozenset");
+        const res = if (is_frozen) try collections.PySetObject.createFrozen(self.mm) else try collections.PySetObject.create(self.mm);
+        errdefer res.base.decRef(self.mm);
+        const set_a = a.as(collections.PySetObject);
+        const set_b = b.as(collections.PySetObject);
+        for (0..set_a.entries_size) |i| {
+            if (set_a.entries[i].key) |key| {
+                if (try set_b.contains(key, self.mm)) {
+                    try res.add(key, self.mm);
+                }
+            }
+        }
+        return &res.base;
+    }
+
+    fn setUnion(self: *VM, a: *PyObject, b: *PyObject) anyerror!*PyObject {
+        const is_frozen = std.mem.eql(u8, a.type_obj.name, "frozenset");
+        const res = if (is_frozen) try collections.PySetObject.createFrozen(self.mm) else try collections.PySetObject.create(self.mm);
+        errdefer res.base.decRef(self.mm);
+        const set_a = a.as(collections.PySetObject);
+        const set_b = b.as(collections.PySetObject);
+        for (0..set_a.entries_size) |i| {
+            if (set_a.entries[i].key) |key| {
+                try res.add(key, self.mm);
+            }
+        }
+        for (0..set_b.entries_size) |i| {
+            if (set_b.entries[i].key) |key| {
+                try res.add(key, self.mm);
+            }
+        }
+        return &res.base;
+    }
+
+    fn setXor(self: *VM, a: *PyObject, b: *PyObject) anyerror!*PyObject {
+        const is_frozen = std.mem.eql(u8, a.type_obj.name, "frozenset");
+        const res = if (is_frozen) try collections.PySetObject.createFrozen(self.mm) else try collections.PySetObject.create(self.mm);
+        errdefer res.base.decRef(self.mm);
+        const set_a = a.as(collections.PySetObject);
+        const set_b = b.as(collections.PySetObject);
+        for (0..set_a.entries_size) |i| {
+            if (set_a.entries[i].key) |key| {
+                if (!(try set_b.contains(key, self.mm))) {
+                    try res.add(key, self.mm);
+                }
+            }
+        }
+        for (0..set_b.entries_size) |i| {
+            if (set_b.entries[i].key) |key| {
+                if (!(try set_a.contains(key, self.mm))) {
+                    try res.add(key, self.mm);
+                }
+            }
+        }
+        return &res.base;
+    }
+
+    fn setDifference(self: *VM, a: *PyObject, b: *PyObject) anyerror!*PyObject {
+        const is_frozen = std.mem.eql(u8, a.type_obj.name, "frozenset");
+        const res = if (is_frozen) try collections.PySetObject.createFrozen(self.mm) else try collections.PySetObject.create(self.mm);
+        errdefer res.base.decRef(self.mm);
+        const set_a = a.as(collections.PySetObject);
+        const set_b = b.as(collections.PySetObject);
+        for (0..set_a.entries_size) |i| {
+            if (set_a.entries[i].key) |key| {
+                if (!(try set_b.contains(key, self.mm))) {
+                    try res.add(key, self.mm);
+                }
+            }
+        }
+        return &res.base;
+    }
+
     fn raiseException(self: *VM, exc: *PyObject) anyerror!void {
         exc.incRef();
         
@@ -587,18 +783,83 @@ pub const VM = struct {
                 f.block_stack_top -= 1;
                 const block = f.block_stack[f.block_stack_top];
                 
-                while (f.stack_top > block.stack_level) {
-                    f.stack_top -= 1;
-                    f.stack[f.stack_top].decRef(self.mm);
+                if (block.type == .With) {
+                    defer block.exit_func.?.decRef(self.mm);
+                    
+                    while (f.stack_top > block.stack_level) {
+                        f.stack_top -= 1;
+                        f.stack[f.stack_top].decRef(self.mm);
+                    }
+                    
+                    const exc_type = if (std.mem.eql(u8, exc.type_obj.name, "object")) b: {
+                        const inst = exc.as(class_mod.PyInstanceObject);
+                        inst.class_obj.base.incRef();
+                        break :b &inst.class_obj.base;
+                    } else b: {
+                        const wrapper = try @import("../stdlib/builtins.zig").PyTypeWrapper.create(exc.type_obj, self.mm);
+                        break :b &wrapper.base;
+                    };
+                    defer exc_type.decRef(self.mm);
+                    
+                    exc.incRef();
+                    PyNone.incRef();
+                    exc_type.incRef();
+                    var args = [_]*PyObject{ exc_type, exc, PyNone };
+                    
+                    var nesting: usize = 0;
+                    var scan_ip = f.ip;
+                    var exit_ip: ?usize = null;
+                    while (scan_ip < f.code.instructions.len) : (scan_ip += 1) {
+                        const op = f.code.instructions[scan_ip].op;
+                        if (op == .BEFORE_WITH) {
+                            nesting += 1;
+                        } else if (op == .EXIT_WITH) {
+                            if (nesting == 0) {
+                                exit_ip = scan_ip;
+                                break;
+                            } else {
+                                nesting -= 1;
+                            }
+                        }
+                    }
+                    
+                    const prev_frame_count = self.frame_count;
+                    try self.callObject(block.exit_func.?, &args, null);
+                    
+                    if (self.frame_count > prev_frame_count) {
+                        try self.runLoop(prev_frame_count);
+                    }
+                    
+                    const exit_res = f.pop();
+                    defer exit_res.decRef(self.mm);
+                    
+                    var is_true = false;
+                    if (std.mem.eql(u8, exit_res.type_obj.name, "bool")) {
+                        is_true = exit_res == PyTrue;
+                    } else if (exit_res.type_obj.tp_bool) |bool_fn| {
+                        is_true = bool_fn(exit_res);
+                    }
+                    
+                    if (is_true) {
+                        f.ip = exit_ip.? + 1;
+                        PyNone.incRef();
+                        f.push(PyNone);
+                        return;
+                    }
+                } else {
+                    while (f.stack_top > block.stack_level) {
+                        f.stack_top -= 1;
+                        f.stack[f.stack_top].decRef(self.mm);
+                    }
+                    
+                    if (f.active_exception) |ae| ae.decRef(self.mm);
+                    f.active_exception = exc;
+                    
+                    f.ip = block.handler;
+                    exc.incRef();
+                    f.push(exc);
+                    return;
                 }
-                
-                if (f.active_exception) |ae| ae.decRef(self.mm);
-                f.active_exception = exc;
-                
-                f.ip = block.handler;
-                exc.incRef();
-                f.push(exc);
-                return;
             }
             
             f.deinit(self.mm, self.allocator);
@@ -756,6 +1017,12 @@ pub const VM = struct {
                         const res = try primitives.PyIntObject.create(val_a - val_b, self.mm);
                         a.decRef(self.mm);
                         b.decRef(self.mm);
+                        push(f, &stack_top, res);
+                    } else if ((std.mem.eql(u8, a.type_obj.name, "set") or std.mem.eql(u8, a.type_obj.name, "frozenset")) and
+                               (std.mem.eql(u8, b.type_obj.name, "set") or std.mem.eql(u8, b.type_obj.name, "frozenset"))) {
+                        defer a.decRef(self.mm);
+                        defer b.decRef(self.mm);
+                        const res = try self.setDifference(a, b);
                         push(f, &stack_top, res);
                     } else {
                         defer a.decRef(self.mm);
@@ -949,6 +1216,26 @@ pub const VM = struct {
                         values[idx].decRef(self.mm);
                     }
                     push(f, &stack_top, &dict.base);
+                },
+                .BUILD_SET => {
+                    const count = instr.arg;
+                    const set_obj = try collections.PySetObject.create(self.mm);
+                    errdefer set_obj.base.decRef(self.mm);
+                    
+                    if (count > 0) {
+                        var keys = try self.allocator.alloc(*PyObject, count);
+                        defer self.allocator.free(keys);
+                        
+                        var i: usize = 0;
+                        while (i < count) : (i += 1) {
+                            keys[count - 1 - i] = pop(f, &stack_top);
+                        }
+                        for (keys) |key| {
+                            try set_obj.add(key, self.mm);
+                            key.decRef(self.mm);
+                        }
+                    }
+                    push(f, &stack_top, &set_obj.base);
                 },
                 .MAKE_FUNCTION => {
                     const code_obj = pop(f, &stack_top);
@@ -1397,7 +1684,12 @@ pub const VM = struct {
                     defer iterable.decRef(self.mm);
                     
                     const name = iterable.type_obj.name;
-                    if (std.mem.eql(u8, name, "list")) {
+                    if (std.mem.eql(u8, name, "generator")) {
+                        iterable.incRef();
+                        push(f, &stack_top, iterable);
+                        PyNone.incRef();
+                        push(f, &stack_top, PyNone);
+                    } else if (std.mem.eql(u8, name, "list")) {
                         // Already a list — wrap as iterator: push [list, 0]
                         iterable.incRef();
                         push(f, &stack_top, iterable);
@@ -1453,39 +1745,69 @@ pub const VM = struct {
                     defer idx_obj.decRef(self.mm);
                     const iterable = f.stack[stack_top - 1]; // peek, don't pop
                     
-                    const idx = idx_obj.as(primitives.PyIntObject).value;
-                    const name = iterable.type_obj.name;
-                    
-                    var size: i64 = 0;
-                    if (std.mem.eql(u8, name, "list")) {
-                        size = @intCast(iterable.as(PyListObject).size);
-                    } else if (std.mem.eql(u8, name, "tuple")) {
-                        size = @intCast(iterable.as(PyTupleObject).size);
-                    }
-                    
-                    if (idx < size) {
-                        // Get item
-                        var item: *PyObject = undefined;
-                        if (std.mem.eql(u8, name, "list")) {
-                            const list = iterable.as(PyListObject);
-                            item = list.items.?[@intCast(idx)];
-                        } else if (std.mem.eql(u8, name, "tuple")) {
-                            const tuple = iterable.as(PyTupleObject);
-                            item = tuple.items()[@intCast(idx)];
+                    if (std.mem.eql(u8, iterable.type_obj.name, "generator")) {
+                        const gen = iterable.as(function_mod.PyGeneratorObject);
+                        if (gen.is_closed) {
+                            const g_obj = pop(f, &stack_top);
+                            g_obj.decRef(self.mm);
+                            ip = instr.arg;
                         } else {
-                            return error.TypeError;
+                            f.ip = ip - 1;
+                            f.stack_top = stack_top;
+                            
+                            self.frames[self.frame_count] = gen.frame;
+                            self.frame_count += 1;
+                            
+                            frame_idx = self.frame_count - 1;
+                            f = &self.frames[frame_idx];
+                            ip = f.ip;
+                            stack_top = f.stack_top;
+                            instructions = f.code.instructions;
+                            consts = f.code.consts;
+                            names = f.code.names;
+                            varnames = f.code.varnames;
+                            fastlocals = f.fastlocals;
+                            globals = f.globals;
+                            locals = &f.locals;
+                            is_module = f.is_module;
+                            is_class_body = f.is_class_body;
+                            func = f.func;
+                        }
+                    } else {
+                        const idx = idx_obj.as(primitives.PyIntObject).value;
+                        const name = iterable.type_obj.name;
+                        
+                        var size: i64 = 0;
+                        if (std.mem.eql(u8, name, "list")) {
+                            size = @intCast(iterable.as(PyListObject).size);
+                        } else if (std.mem.eql(u8, name, "tuple")) {
+                            size = @intCast(iterable.as(PyTupleObject).size);
                         }
                         
-                        // Push next index
-                        const new_idx = try primitives.PyIntObject.create(idx + 1, self.mm);
-                        push(f, &stack_top, new_idx);
-                        
-                        // Push the item
-                        item.incRef();
-                        push(f, &stack_top, item);
-                    } else {
-                        // Iterator exhausted — jump to end
-                        ip = instr.arg;
+                        if (idx < size) {
+                            // Get item
+                            var item: *PyObject = undefined;
+                            if (std.mem.eql(u8, name, "list")) {
+                                const list = iterable.as(PyListObject);
+                                item = list.items.?[@intCast(idx)];
+                            } else if (std.mem.eql(u8, name, "tuple")) {
+                                const tuple = iterable.as(PyTupleObject);
+                                item = tuple.items()[@intCast(idx)];
+                            } else {
+                                return error.TypeError;
+                            }
+                            
+                            // Push next index
+                            const new_idx = try primitives.PyIntObject.create(idx + 1, self.mm);
+                            push(f, &stack_top, new_idx);
+                            
+                            // Push the item
+                            item.incRef();
+                            push(f, &stack_top, item);
+                        } else {
+                            // Iterator exhausted — jump to end
+                            ip = instr.arg;
+                        }
                     }
                 },
                 .BINARY_SUBSCR => {
@@ -1533,6 +1855,28 @@ pub const VM = struct {
                         const uidx: usize = @intCast(actual_idx);
                         const ch_str = try PyStringObject.create(str_val[uidx..uidx+1], self.mm);
                         push(f, &stack_top, ch_str);
+                    } else if (std.mem.eql(u8, name, "bytes")) {
+                        const bytes_obj = container.as(primitives.PyBytesObject);
+                        const idx = index.as(primitives.PyIntObject).value;
+                        const actual_idx = if (idx < 0) @as(i64, @intCast(bytes_obj.len)) + idx else idx;
+                        if (actual_idx < 0 or actual_idx >= @as(i64, @intCast(bytes_obj.len))) {
+                            return error.IndexError;
+                        }
+                        const uidx: usize = @intCast(actual_idx);
+                        const val = bytes_obj.ptr[uidx];
+                        const int_obj = try primitives.PyIntObject.create(val, self.mm);
+                        push(f, &stack_top, int_obj);
+                    } else if (std.mem.eql(u8, name, "bytearray")) {
+                        const ba_obj = container.as(primitives.PyByteArrayObject);
+                        const idx = index.as(primitives.PyIntObject).value;
+                        const actual_idx = if (idx < 0) @as(i64, @intCast(ba_obj.size)) + idx else idx;
+                        if (actual_idx < 0 or actual_idx >= @as(i64, @intCast(ba_obj.size))) {
+                            return error.IndexError;
+                        }
+                        const uidx: usize = @intCast(actual_idx);
+                        const val = ba_obj.items.?[uidx];
+                        const int_obj = try primitives.PyIntObject.create(val, self.mm);
+                        push(f, &stack_top, int_obj);
                     } else {
                         return error.TypeError;
                     }
@@ -1561,6 +1905,22 @@ pub const VM = struct {
                     } else if (std.mem.eql(u8, name, "dict")) {
                         const dict = container.as(PyDictObject);
                         try dict.setItem(index, value, self.mm);
+                    } else if (std.mem.eql(u8, name, "bytearray")) {
+                        const ba_obj = container.as(primitives.PyByteArrayObject);
+                        const idx = index.as(primitives.PyIntObject).value;
+                        const actual_idx = if (idx < 0) @as(i64, @intCast(ba_obj.size)) + idx else idx;
+                        if (actual_idx < 0 or actual_idx >= @as(i64, @intCast(ba_obj.size))) {
+                            return error.IndexError;
+                        }
+                        const uidx: usize = @intCast(actual_idx);
+                        if (!std.mem.eql(u8, value.type_obj.name, "int")) {
+                            return error.TypeError;
+                        }
+                        const val = value.as(primitives.PyIntObject).value;
+                        if (val < 0 or val > 255) {
+                            return error.ValueError;
+                        }
+                        ba_obj.items.?[uidx] = @intCast(val);
                     } else {
                         return error.TypeError;
                     }
@@ -1678,6 +2038,235 @@ pub const VM = struct {
                     const res = if (result) PyTrue else PyFalse;
                     res.incRef();
                     push(f, &stack_top, res);
+                },
+                .BINARY_AND => {
+                    const b = pop(f, &stack_top);
+                    const a = pop(f, &stack_top);
+
+                    if (std.mem.eql(u8, a.type_obj.name, "int") and std.mem.eql(u8, b.type_obj.name, "int")) {
+                        const val_a = a.as(primitives.PyIntObject).value;
+                        const val_b = b.as(primitives.PyIntObject).value;
+                        const res = try primitives.PyIntObject.create(val_a & val_b, self.mm);
+                        a.decRef(self.mm);
+                        b.decRef(self.mm);
+                        push(f, &stack_top, res);
+                    } else if ((std.mem.eql(u8, a.type_obj.name, "set") or std.mem.eql(u8, a.type_obj.name, "frozenset")) and
+                               (std.mem.eql(u8, b.type_obj.name, "set") or std.mem.eql(u8, b.type_obj.name, "frozenset"))) {
+                        defer a.decRef(self.mm);
+                        defer b.decRef(self.mm);
+                        const res = try self.setIntersection(a, b);
+                        push(f, &stack_top, res);
+                    } else {
+                        a.decRef(self.mm);
+                        b.decRef(self.mm);
+                        return error.TypeError;
+                    }
+                },
+                .BINARY_OR => {
+                    const b = pop(f, &stack_top);
+                    const a = pop(f, &stack_top);
+
+                    if (std.mem.eql(u8, a.type_obj.name, "int") and std.mem.eql(u8, b.type_obj.name, "int")) {
+                        const val_a = a.as(primitives.PyIntObject).value;
+                        const val_b = b.as(primitives.PyIntObject).value;
+                        const res = try primitives.PyIntObject.create(val_a | val_b, self.mm);
+                        a.decRef(self.mm);
+                        b.decRef(self.mm);
+                        push(f, &stack_top, res);
+                    } else if ((std.mem.eql(u8, a.type_obj.name, "set") or std.mem.eql(u8, a.type_obj.name, "frozenset")) and
+                               (std.mem.eql(u8, b.type_obj.name, "set") or std.mem.eql(u8, b.type_obj.name, "frozenset"))) {
+                        defer a.decRef(self.mm);
+                        defer b.decRef(self.mm);
+                        const res = try self.setUnion(a, b);
+                        push(f, &stack_top, res);
+                    } else {
+                        a.decRef(self.mm);
+                        b.decRef(self.mm);
+                        return error.TypeError;
+                    }
+                },
+                .BINARY_XOR => {
+                    const b = pop(f, &stack_top);
+                    const a = pop(f, &stack_top);
+
+                    if (std.mem.eql(u8, a.type_obj.name, "int") and std.mem.eql(u8, b.type_obj.name, "int")) {
+                        const val_a = a.as(primitives.PyIntObject).value;
+                        const val_b = b.as(primitives.PyIntObject).value;
+                        const res = try primitives.PyIntObject.create(val_a ^ val_b, self.mm);
+                        a.decRef(self.mm);
+                        b.decRef(self.mm);
+                        push(f, &stack_top, res);
+                    } else if ((std.mem.eql(u8, a.type_obj.name, "set") or std.mem.eql(u8, a.type_obj.name, "frozenset")) and
+                               (std.mem.eql(u8, b.type_obj.name, "set") or std.mem.eql(u8, b.type_obj.name, "frozenset"))) {
+                        defer a.decRef(self.mm);
+                        defer b.decRef(self.mm);
+                        const res = try self.setXor(a, b);
+                        push(f, &stack_top, res);
+                    } else {
+                        a.decRef(self.mm);
+                        b.decRef(self.mm);
+                        return error.TypeError;
+                    }
+                },
+                .BINARY_LSHIFT => {
+                    const b = pop(f, &stack_top);
+                    const a = pop(f, &stack_top);
+                    defer a.decRef(self.mm);
+                    defer b.decRef(self.mm);
+
+                    if (std.mem.eql(u8, a.type_obj.name, "int") and std.mem.eql(u8, b.type_obj.name, "int")) {
+                        const val_a = a.as(primitives.PyIntObject).value;
+                        const val_b = b.as(primitives.PyIntObject).value;
+                        if (val_b < 0) {
+                            std.debug.print("ValueError: negative shift count\n", .{});
+                            return error.ValueError;
+                        }
+                        const res_val = if (val_b >= 64) @as(i64, 0) else val_a << @intCast(val_b);
+                        const res = try primitives.PyIntObject.create(res_val, self.mm);
+                        push(f, &stack_top, res);
+                    } else {
+                        return error.TypeError;
+                    }
+                },
+                .BINARY_RSHIFT => {
+                    const b = pop(f, &stack_top);
+                    const a = pop(f, &stack_top);
+                    defer a.decRef(self.mm);
+                    defer b.decRef(self.mm);
+
+                    if (std.mem.eql(u8, a.type_obj.name, "int") and std.mem.eql(u8, b.type_obj.name, "int")) {
+                        const val_a = a.as(primitives.PyIntObject).value;
+                        const val_b = b.as(primitives.PyIntObject).value;
+                        if (val_b < 0) {
+                            std.debug.print("ValueError: negative shift count\n", .{});
+                            return error.ValueError;
+                        }
+                        const res_val = if (val_b >= 64) (if (val_a < 0) @as(i64, -1) else @as(i64, 0)) else val_a >> @intCast(val_b);
+                        const res = try primitives.PyIntObject.create(res_val, self.mm);
+                        push(f, &stack_top, res);
+                    } else {
+                        return error.TypeError;
+                    }
+                },
+                .BINARY_MATRIX_MULTIPLY => {
+                    const b = pop(f, &stack_top);
+                    const a = pop(f, &stack_top);
+                    defer a.decRef(self.mm);
+                    defer b.decRef(self.mm);
+                    return error.TypeError;
+                },
+                .UNARY_INVERT => {
+                    const a = pop(f, &stack_top);
+                    defer a.decRef(self.mm);
+
+                    if (std.mem.eql(u8, a.type_obj.name, "int")) {
+                        const val_a = a.as(primitives.PyIntObject).value;
+                        const res = try primitives.PyIntObject.create(~val_a, self.mm);
+                        push(f, &stack_top, res);
+                    } else {
+                        return error.TypeError;
+                    }
+                },
+                .BEFORE_WITH => {
+                    const mgr = pop(f, &stack_top);
+                    defer mgr.decRef(self.mm);
+
+                    const enter_fn = try self.loadAttribute(mgr, "__enter__");
+                    defer enter_fn.decRef(self.mm);
+                    const exit_fn = try self.loadAttribute(mgr, "__exit__");
+
+                    if (f.block_stack_top >= 16) return error.StackOverflow;
+                    f.block_stack[f.block_stack_top] = .{
+                        .type = .With,
+                        .handler = 0,
+                        .stack_level = stack_top,
+                        .exit_func = exit_fn,
+                    };
+                    f.block_stack_top += 1;
+
+                    f.ip = ip;
+                    f.stack_top = stack_top;
+                    const args = &[_]*PyObject{};
+                    try self.callObject(enter_fn, args, null);
+
+                    frame_idx = self.frame_count - 1;
+                    f = &self.frames[frame_idx];
+                    ip = f.ip;
+                    stack_top = f.stack_top;
+                    instructions = f.code.instructions;
+                    consts = f.code.consts;
+                    names = f.code.names;
+                    varnames = f.code.varnames;
+                    fastlocals = f.fastlocals;
+                    globals = f.globals;
+                    locals = &f.locals;
+                    is_module = f.is_module;
+                    is_class_body = f.is_class_body;
+                    func = f.func;
+                },
+                .EXIT_WITH => {
+                    if (f.block_stack_top == 0) return error.SystemError;
+                    f.block_stack_top -= 1;
+                    const block = f.block_stack[f.block_stack_top];
+                    if (block.type != .With) return error.SystemError;
+
+                    const exit_fn = block.exit_func.?;
+                    defer exit_fn.decRef(self.mm);
+
+                    f.ip = ip;
+                    f.stack_top = stack_top;
+
+                    PyNone.incRef();
+                    PyNone.incRef();
+                    PyNone.incRef();
+                    var args = [_]*PyObject{ PyNone, PyNone, PyNone };
+                    try self.callObject(exit_fn, &args, null);
+
+                    frame_idx = self.frame_count - 1;
+                    f = &self.frames[frame_idx];
+                    ip = f.ip;
+                    stack_top = f.stack_top;
+                    instructions = f.code.instructions;
+                    consts = f.code.consts;
+                    names = f.code.names;
+                    varnames = f.code.varnames;
+                    fastlocals = f.fastlocals;
+                    globals = f.globals;
+                    locals = &f.locals;
+                    is_module = f.is_module;
+                    is_class_body = f.is_class_body;
+                    func = f.func;
+                },
+                .YIELD_VALUE => {
+                    const val = pop(f, &stack_top);
+                    const gen = f.generator.?.as(function_mod.PyGeneratorObject);
+
+                    f.ip = ip;
+                    f.stack_top = stack_top;
+                    gen.frame = f.*;
+
+                    self.frame_count -= 1;
+
+                    frame_idx = self.frame_count - 1;
+                    f = &self.frames[frame_idx];
+                    ip = f.ip;
+                    stack_top = f.stack_top;
+                    instructions = f.code.instructions;
+                    consts = f.code.consts;
+                    names = f.code.names;
+                    varnames = f.code.varnames;
+                    fastlocals = f.fastlocals;
+                    globals = f.globals;
+                    locals = &f.locals;
+                    is_module = f.is_module;
+                    is_class_body = f.is_class_body;
+                    func = f.func;
+
+                    if (instructions[ip].op == .FOR_ITER) {
+                        const dummy = try primitives.PyIntObject.create(0, self.mm);
+                        push(f, &stack_top, dummy);
+                    }
+                    push(f, &stack_top, val);
                 },
             }
         }

@@ -26,6 +26,7 @@ pub const Opcode = enum(u8) {
     BUILD_LIST,
     BUILD_TUPLE,
     BUILD_MAP,
+    BUILD_SET,
     MAKE_FUNCTION,
     CALL,
     
@@ -62,6 +63,16 @@ pub const Opcode = enum(u8) {
     DELETE_ATTR,
     IS_OP,         // arg=0 for `is`, arg=1 for `is not`
     CONTAINS_OP,   // arg=0 for `in`, arg=1 for `not in`
+    BINARY_AND,
+    BINARY_OR,
+    BINARY_XOR,
+    BINARY_LSHIFT,
+    BINARY_RSHIFT,
+    BINARY_MATRIX_MULTIPLY,
+    UNARY_INVERT,
+    BEFORE_WITH,
+    YIELD_VALUE,
+    EXIT_WITH,
 };
 
 pub const Instruction = struct {
@@ -74,7 +85,8 @@ pub const PyCodeObject = struct {
     consts: []*PyObject,
     names: [][]const u8,
     argcount: usize = 0,
-    varnames: [][]const u8 = &[_][]const u8{}, // local variable names for arguments
+    varnames: [][]const u8 = &[_][]const u8{},
+    is_generator: bool = false, // local variable names for arguments
 
     pub fn deinit(self: *PyCodeObject, allocator: std.mem.Allocator, mm: *PyMemoryManager) void {
         allocator.free(self.instructions);

@@ -9,6 +9,7 @@ pub const PyMemoryManager = struct {
 
     int_free_list: ?*anyopaque = null,
     float_free_list: ?*anyopaque = null,
+    complex_free_list: ?*anyopaque = null,
 
     pub fn init(allocator: std.mem.Allocator) PyMemoryManager {
         return .{
@@ -38,6 +39,16 @@ pub const PyMemoryManager = struct {
             float_node = next;
         }
         self.float_free_list = null;
+
+        var complex_node = self.complex_free_list;
+        while (complex_node) |node| {
+            const next = @as(*?*anyopaque, @ptrCast(@alignCast(node))).*;
+            const ptr = @as(*primitives.PyComplexObject, @ptrCast(@alignCast(node)));
+            self.allocator.destroy(ptr);
+            self.allocated_bytes -= @sizeOf(primitives.PyComplexObject);
+            complex_node = next;
+        }
+        self.complex_free_list = null;
     }
 
     pub fn alloc(self: *PyMemoryManager, comptime T: type) !*T {

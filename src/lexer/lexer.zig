@@ -12,17 +12,26 @@ pub const TokenType = enum {
     identifier,
     number_int,
     number_float,
+    number_complex,
     string,
+    bytes,
 
     // Operators and delimiters
     plus, minus, star, slash, percent, equal, double_equal, not_equal,
     less, less_equal, greater, greater_equal,
     lparen, rparen, lbrace, rbrace, lbracket, rbracket,
     colon, comma, newline, indent, dedent, dot, semicolon,
+    ampersand, vbar, caret, tilde,
+    left_shift, right_shift,
+    at,
+    colon_equal,
     // Augmented assignment and compound operators
     plus_equal, minus_equal, star_equal, slash_equal, percent_equal,
     double_star, double_slash,
     double_star_equal, double_slash_equal,
+    ampersand_equal, vbar_equal, caret_equal,
+    left_shift_equal, right_shift_equal,
+    at_equal,
 
     // Special
     eof,
@@ -252,7 +261,13 @@ pub const Lexer = struct {
                     if (self.paren_depth > 0) self.paren_depth -= 1;
                     return .{ .type = .rbracket, .lexeme = "]", .line = start_line, .column = start_col };
                 },
-                ':' => return .{ .type = .colon, .lexeme = ":", .line = start_line, .column = start_col },
+                ':' => {
+                    if (self.peek() == '=') {
+                        _ = self.advance();
+                        return .{ .type = .colon_equal, .lexeme = ":=", .line = start_line, .column = start_col };
+                    }
+                    return .{ .type = .colon, .lexeme = ":", .line = start_line, .column = start_col };
+                },
                 ',' => return .{ .type = .comma, .lexeme = ",", .line = start_line, .column = start_col },
                 '.' => return .{ .type = .dot, .lexeme = ".", .line = start_line, .column = start_col },
                 ';' => {
@@ -329,6 +344,14 @@ pub const Lexer = struct {
                     return .{ .type = .invalid, .lexeme = "!", .line = start_line, .column = start_col };
                 },
                 '<' => {
+                    if (self.peek() == '<') {
+                        _ = self.advance();
+                        if (self.peek() == '=') {
+                            _ = self.advance();
+                            return .{ .type = .left_shift_equal, .lexeme = "<<=", .line = start_line, .column = start_col };
+                        }
+                        return .{ .type = .left_shift, .lexeme = "<<", .line = start_line, .column = start_col };
+                    }
                     if (self.peek() == '=') {
                         _ = self.advance();
                         return .{ .type = .less_equal, .lexeme = "<=", .line = start_line, .column = start_col };
@@ -336,11 +359,50 @@ pub const Lexer = struct {
                     return .{ .type = .less, .lexeme = "<", .line = start_line, .column = start_col };
                 },
                 '>' => {
+                    if (self.peek() == '>') {
+                        _ = self.advance();
+                        if (self.peek() == '=') {
+                            _ = self.advance();
+                            return .{ .type = .right_shift_equal, .lexeme = ">>=", .line = start_line, .column = start_col };
+                        }
+                        return .{ .type = .right_shift, .lexeme = ">>", .line = start_line, .column = start_col };
+                    }
                     if (self.peek() == '=') {
                         _ = self.advance();
                         return .{ .type = .greater_equal, .lexeme = ">=", .line = start_line, .column = start_col };
                     }
                     return .{ .type = .greater, .lexeme = ">", .line = start_line, .column = start_col };
+                },
+                '&' => {
+                    if (self.peek() == '=') {
+                        _ = self.advance();
+                        return .{ .type = .ampersand_equal, .lexeme = "&=", .line = start_line, .column = start_col };
+                    }
+                    return .{ .type = .ampersand, .lexeme = "&", .line = start_line, .column = start_col };
+                },
+                '|' => {
+                    if (self.peek() == '=') {
+                        _ = self.advance();
+                        return .{ .type = .vbar_equal, .lexeme = "|=", .line = start_line, .column = start_col };
+                    }
+                    return .{ .type = .vbar, .lexeme = "|", .line = start_line, .column = start_col };
+                },
+                '^' => {
+                    if (self.peek() == '=') {
+                        _ = self.advance();
+                        return .{ .type = .caret_equal, .lexeme = "^=", .line = start_line, .column = start_col };
+                    }
+                    return .{ .type = .caret, .lexeme = "^", .line = start_line, .column = start_col };
+                },
+                '~' => {
+                    return .{ .type = .tilde, .lexeme = "~", .line = start_line, .column = start_col };
+                },
+                '@' => {
+                    if (self.peek() == '=') {
+                        _ = self.advance();
+                        return .{ .type = .at_equal, .lexeme = "@=", .line = start_line, .column = start_col };
+                    }
+                    return .{ .type = .at, .lexeme = "@", .line = start_line, .column = start_col };
                 },
                 '\'' , '"' => {
                     // String literal
@@ -356,6 +418,18 @@ pub const Lexer = struct {
                     return .{ .type = .string, .lexeme = lexeme, .line = start_line, .column = start_col };
                 },
                 else => {
+                    if ((c == 'b' or c == 'B') and (self.peek() == '\'' or self.peek() == '"')) {
+                        const quote = self.advance();
+                        while (self.index < self.source.len and self.peek() != quote) {
+                            _ = self.advance();
+                        }
+                        if (self.index >= self.source.len) {
+                            return .{ .type = .invalid, .lexeme = "Unterminated bytes literal", .line = start_line, .column = start_col };
+                        }
+                        _ = self.advance(); // consume quote
+                        const lexeme = self.source[start_idx + 2 .. self.index - 1];
+                        return .{ .type = .bytes, .lexeme = lexeme, .line = start_line, .column = start_col };
+                    }
                     if (std.ascii.isDigit(c)) {
                         // Integer or Float
                         var is_float = false;
@@ -369,9 +443,14 @@ pub const Lexer = struct {
                                 _ = self.advance();
                             }
                         }
+                        var is_complex = false;
+                        if (self.peek() == 'j' or self.peek() == 'J') {
+                            is_complex = true;
+                            _ = self.advance(); // consume 'j' or 'J'
+                        }
                         const lexeme = self.source[start_idx..self.index];
                         return .{
-                            .type = if (is_float) .number_float else .number_int,
+                            .type = if (is_complex) .number_complex else (if (is_float) .number_float else .number_int),
                             .lexeme = lexeme,
                             .line = start_line,
                             .column = start_col,

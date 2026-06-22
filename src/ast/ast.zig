@@ -8,6 +8,12 @@ pub const Op = enum {
     Mod,
     Pow,
     FloorDiv,
+    And,
+    Or,
+    Xor,
+    LShift,
+    RShift,
+    MatMul,
 };
 
 pub const CompareOp = enum {
@@ -28,7 +34,9 @@ pub const ConstantValue = union(enum) {
     Bool: bool,
     Int: i64,
     Float: f64,
+    Complex: struct { real: f64, imag: f64 },
     String: []const u8,
+    Bytes: []const u8,
 };
 
 pub const ExceptHandler = struct {
@@ -37,9 +45,31 @@ pub const ExceptHandler = struct {
     body: []AST,
 };
 
+pub const WithItem = struct {
+    context_expr: AST,
+    optional_vars: ?*AST,
+};
+
 pub const AST = union(enum) {
     Module: struct {
         body: []AST,
+    },
+    NamedExpr: struct {
+        target: []const u8,
+        value: *AST,
+    },
+    Yield: struct {
+        value: ?*AST,
+    },
+    YieldFrom: struct {
+        value: *AST,
+    },
+    With: struct {
+        items: []WithItem,
+        body: []AST,
+    },
+    Await: struct {
+        value: *AST,
     },
     Assign: struct {
         target: []const u8,
@@ -91,11 +121,15 @@ pub const AST = union(enum) {
         keys: []AST,
         values: []AST,
     },
+    Set: struct {
+        elts: []AST,
+    },
     FunctionDef: struct {
         name: []const u8,
         args: [][]const u8,
         defaults: []AST,
         body: []AST,
+        decorators: []AST,
     },
     Lambda: struct {
         args: [][]const u8,
@@ -113,6 +147,7 @@ pub const AST = union(enum) {
         name: []const u8,
         base: ?[]const u8,
         body: []AST,
+        decorators: []AST,
     },
     Attribute: struct {
         value: *AST,
@@ -166,7 +201,7 @@ pub const AST = union(enum) {
         right: *AST,
     },
     UnaryOp: struct {
-        op: enum { Not, Neg },
+        op: enum { Not, Neg, Invert },
         operand: *AST,
     },
 };

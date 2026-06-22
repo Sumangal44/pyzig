@@ -45,3 +45,59 @@ pub const PyAssertionError_Type = PyTypeObject{
     .tp_repr = exception_repr,
     .tp_str = exception_repr,
 };
+
+pub const PyTypeError_Type = PyTypeObject{
+    .name = "TypeError",
+    .tp_dealloc = exception_dealloc,
+    .tp_repr = exception_repr,
+    .tp_str = exception_repr,
+};
+
+pub const PyValueError_Type = PyTypeObject{
+    .name = "ValueError",
+    .tp_dealloc = exception_dealloc,
+    .tp_repr = exception_repr,
+    .tp_str = exception_repr,
+};
+
+pub const PyKeyError_Type = PyTypeObject{
+    .name = "KeyError",
+    .tp_dealloc = exception_dealloc,
+    .tp_repr = exception_repr,
+    .tp_str = exception_repr,
+};
+
+pub const PyIndexError_Type = PyTypeObject{
+    .name = "IndexError",
+    .tp_dealloc = exception_dealloc,
+    .tp_repr = exception_repr,
+    .tp_str = exception_repr,
+};
+
+pub const PyStopIteration_Type = PyTypeObject{
+    .name = "StopIteration",
+    .tp_dealloc = exception_dealloc,
+    .tp_repr = exception_repr,
+    .tp_str = exception_repr,
+};
+
+pub const PyAttributeError_Type = PyTypeObject{
+    .name = "AttributeError",
+    .tp_dealloc = exception_dealloc,
+    .tp_repr = exception_repr,
+    .tp_str = exception_repr,
+};
+
+pub const PyNameError_Type = PyTypeObject{
+    .name = "NameError",
+    .tp_dealloc = exception_dealloc,
+    .tp_repr = exception_repr,
+    .tp_str = exception_repr,
+};
+
+pub const PyRuntimeError_Type = PyTypeObject{
+    .name = "RuntimeError",
+    .tp_dealloc = exception_dealloc,
+    .tp_repr = exception_repr,
+    .tp_str = exception_repr,
+};

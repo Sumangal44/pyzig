@@ -8,6 +8,7 @@ const ASTBuilder = @import("../ast/ast.zig").ASTBuilder;
 const Op = @import("../ast/ast.zig").Op;
 const CompareOp = @import("../ast/ast.zig").CompareOp;
 const ExceptHandler = @import("../ast/ast.zig").ExceptHandler;
+const WithItem = @import("../ast/ast.zig").WithItem;
 
 pub const Parser = struct {
     lexer: *Lexer,
@@ -64,6 +65,14 @@ pub const Parser = struct {
     fn restoreState(self: *Parser, state: ParserState) void {
         self.lexer.restore(state.lexer_state);
         self.current_token = state.current_token;
+    }
+
+    fn peekNextType(self: *Parser) TokenType {
+        const state = self.saveState();
+        self.advance();
+        const t = self.peekType();
+        self.restoreState(state);
+        return t;
     }
 
     fn skipNewlines(self: *Parser) void {
@@ -246,6 +255,7 @@ pub const Parser = struct {
             .args = try args.toOwnedSlice(self.builder.allocator),
             .defaults = try defaults.toOwnedSlice(self.builder.allocator),
             .body = body,
+            .decorators = &[_]AST{},
         } };
     }
 
@@ -330,6 +340,9 @@ pub const Parser = struct {
     }
 
     fn parseStatement(self: *Parser) anyerror!AST {
+        if (self.peekType() == .at) {
+            return try self.parseDecoratedDef();
+        }
         if (self.peekType() == .kw_if) {
             return try self.parseIfStatement();
         }
@@ -345,8 +358,19 @@ pub const Parser = struct {
         if (self.peekType() == .kw_class) {
             return try self.parseClassDef();
         }
+        if (self.peekType() == .kw_async) {
+            self.advance(); // consume 'async'
+            if (self.peekType() == .kw_def) {
+                return try self.parseFunctionDef();
+            }
+            std.debug.print("Error: Expect 'def' after 'async'\n", .{});
+            return error.ParseError;
+        }
         if (self.peekType() == .kw_try) {
             return try self.parseTryStatement();
+        }
+        if (self.peekType() == .kw_with) {
+            return try self.parseWithStatement();
         }
         if (self.peekType() == .kw_raise) {
             return try self.parseRaiseStatement();
@@ -423,7 +447,13 @@ pub const Parser = struct {
                          self.peekType() == .slash_equal or
                          self.peekType() == .percent_equal or
                          self.peekType() == .double_star_equal or
-                         self.peekType() == .double_slash_equal)
+                         self.peekType() == .double_slash_equal or
+                         self.peekType() == .ampersand_equal or
+                         self.peekType() == .vbar_equal or
+                         self.peekType() == .caret_equal or
+                         self.peekType() == .left_shift_equal or
+                         self.peekType() == .right_shift_equal or
+                         self.peekType() == .at_equal)
                 {
                     const op: Op = switch (self.peekType()) {
                         .plus_equal => .Add,
@@ -433,6 +463,12 @@ pub const Parser = struct {
                         .percent_equal => .Mod,
                         .double_star_equal => .Pow,
                         .double_slash_equal => .FloorDiv,
+                        .ampersand_equal => .And,
+                        .vbar_equal => .Or,
+                        .caret_equal => .Xor,
+                        .left_shift_equal => .LShift,
+                        .right_shift_equal => .RShift,
+                        .at_equal => .MatMul,
                         else => unreachable,
                     };
                     self.advance(); // consume the augmented assignment token
@@ -453,20 +489,36 @@ pub const Parser = struct {
             self.restoreState(state);
         }
 
-        // Try parsing Print statement: print(expr)
-        if (self.peekType() == .identifier and std.mem.eql(u8, self.current_token.lexeme, "print")) {
-            self.advance();
-            try self.consume(.lparen, "Expect '(' after print");
-            const expr = try self.parseExpression();
-            try self.consume(.rparen, "Expect ')' after print expression");
-            return AST{ .Print = .{ .value = try self.builder.newAST(expr) } };
-        }
-
         // Otherwise, it's just an expression statement
         return try self.parseExpression();
     }
 
     fn parseExpression(self: *Parser) anyerror!AST {
+        // NamedExpr (walrus): identifier := value
+        if (self.peekType() == .identifier and self.peekNextType() == .colon_equal) {
+            const name = try self.builder.allocator.dupe(u8, self.current_token.lexeme);
+            self.advance(); // consume name
+            self.advance(); // consume :=
+            const value = try self.parseExpression();
+            return AST{ .NamedExpr = .{
+                .target = name,
+                .value = try self.builder.newAST(value),
+            } };
+        }
+        // Yield / Yield From expression
+        if (self.match(.kw_yield)) {
+            if (self.match(.kw_from)) {
+                const val = try self.parseExpression();
+                return AST{ .YieldFrom = .{ .value = try self.builder.newAST(val) } };
+            }
+            var val: ?*AST = null;
+            const next_tok = self.peekType();
+            if (next_tok != .newline and next_tok != .rparen and next_tok != .rbracket and next_tok != .rbrace and next_tok != .colon and next_tok != .comma and next_tok != .semicolon and next_tok != .eof and next_tok != .dedent) {
+                const yield_expr = try self.parseExpression();
+                val = try self.builder.newAST(yield_expr);
+            }
+            return AST{ .Yield = .{ .value = val } };
+        }
         // Check for lambda
         if (self.peekType() == .kw_lambda) {
             return try self.parseLambda();
@@ -523,7 +575,7 @@ pub const Parser = struct {
     }
 
     fn parseComparison(self: *Parser) anyerror!AST {
-        var expr = try self.parseTerm();
+        var expr = try self.parseBitwiseOr();
         while (true) {
             const op: ?CompareOp = switch (self.peekType()) {
                 .less => .Lt,
@@ -539,7 +591,7 @@ pub const Parser = struct {
                         break :blk CompareOp.IsNot;
                     }
                     // Already consumed 'is'
-                    const right = try self.parseTerm();
+                    const right = try self.parseBitwiseOr();
                     expr = AST{ .Compare = .{
                         .op = .Is,
                         .left = try self.builder.newAST(expr),
@@ -565,9 +617,83 @@ pub const Parser = struct {
                 if (cmp_op != .Is and cmp_op != .IsNot and cmp_op != .NotIn) {
                     self.advance();
                 }
-                const right = try self.parseTerm();
+                const right = try self.parseBitwiseOr();
                 expr = AST{ .Compare = .{
                     .op = cmp_op,
+                    .left = try self.builder.newAST(expr),
+                    .right = try self.builder.newAST(right),
+                } };
+            } else {
+                break;
+            }
+        }
+        return expr;
+    }
+
+    fn parseBitwiseOr(self: *Parser) anyerror!AST {
+        var expr = try self.parseBitwiseXor();
+        while (true) {
+            if (self.match(.vbar)) {
+                const right = try self.parseBitwiseXor();
+                expr = AST{ .BinOp = .{
+                    .op = .Or,
+                    .left = try self.builder.newAST(expr),
+                    .right = try self.builder.newAST(right),
+                } };
+            } else {
+                break;
+            }
+        }
+        return expr;
+    }
+
+    fn parseBitwiseXor(self: *Parser) anyerror!AST {
+        var expr = try self.parseBitwiseAnd();
+        while (true) {
+            if (self.match(.caret)) {
+                const right = try self.parseBitwiseAnd();
+                expr = AST{ .BinOp = .{
+                    .op = .Xor,
+                    .left = try self.builder.newAST(expr),
+                    .right = try self.builder.newAST(right),
+                } };
+            } else {
+                break;
+            }
+        }
+        return expr;
+    }
+
+    fn parseBitwiseAnd(self: *Parser) anyerror!AST {
+        var expr = try self.parseShift();
+        while (true) {
+            if (self.match(.ampersand)) {
+                const right = try self.parseShift();
+                expr = AST{ .BinOp = .{
+                    .op = .And,
+                    .left = try self.builder.newAST(expr),
+                    .right = try self.builder.newAST(right),
+                } };
+            } else {
+                break;
+            }
+        }
+        return expr;
+    }
+
+    fn parseShift(self: *Parser) anyerror!AST {
+        var expr = try self.parseTerm();
+        while (true) {
+            const op: ?Op = switch (self.peekType()) {
+                .left_shift => .LShift,
+                .right_shift => .RShift,
+                else => null,
+            };
+            if (op) |bin_op| {
+                self.advance();
+                const right = try self.parseTerm();
+                expr = AST{ .BinOp = .{
+                    .op = bin_op,
                     .left = try self.builder.newAST(expr),
                     .right = try self.builder.newAST(right),
                 } };
@@ -609,6 +735,7 @@ pub const Parser = struct {
                 .slash => .Div,
                 .percent => .Mod,
                 .double_slash => .FloorDiv,
+                .at => .MatMul,
                 else => null,
             };
             if (op) |bin_op| {
@@ -633,6 +760,17 @@ pub const Parser = struct {
                 .op = .Neg,
                 .operand = try self.builder.newAST(operand),
             } };
+        } else if (self.match(.tilde)) {
+            const operand = try self.parsePower();
+            return AST{ .UnaryOp = .{
+                .op = .Invert,
+                .operand = try self.builder.newAST(operand),
+            } };
+        } else if (self.match(.kw_await)) {
+            const operand = try self.parsePower();
+            return AST{ .Await = .{ .value = try self.builder.newAST(operand) } };
+        } else if (self.match(.plus)) {
+            return try self.parsePower();
         }
         return try self.parsePower();
     }
@@ -671,10 +809,22 @@ pub const Parser = struct {
             self.advance();
             return AST{ .Constant = .{ .Float = val } };
         }
+        if (self.peekType() == .number_complex) {
+            const lexeme = self.current_token.lexeme;
+            const stripped = lexeme[0 .. lexeme.len - 1];
+            const val = try std.fmt.parseFloat(f64, stripped);
+            self.advance();
+            return AST{ .Constant = .{ .Complex = .{ .real = 0.0, .imag = val } } };
+        }
         if (self.peekType() == .string) {
             const lexeme = self.current_token.lexeme;
             self.advance();
             return AST{ .Constant = .{ .String = lexeme } };
+        }
+        if (self.peekType() == .bytes) {
+            const lexeme = self.current_token.lexeme;
+            self.advance();
+            return AST{ .Constant = .{ .Bytes = lexeme } };
         }
         if (self.peekType() == .identifier) {
             const name = self.current_token.lexeme;
@@ -728,34 +878,76 @@ pub const Parser = struct {
             }
         }
 
-        // Dict literal: { "a": 1, "b": 2 }
+        // Dict or Set literal: { ... }
         if (self.match(.lbrace)) {
-            var keys = std.ArrayList(AST).empty;
-            var values = std.ArrayList(AST).empty;
-            errdefer {
-                keys.deinit(self.builder.allocator);
-                values.deinit(self.builder.allocator);
+            if (self.peekType() == .rbrace) {
+                try self.consume(.rbrace, "Expect '}'");
+                return AST{ .Dict = .{
+                    .keys = &[_]AST{},
+                    .values = &[_]AST{},
+                } };
             }
-            while (self.peekType() != .rbrace) {
-                const k = try self.parseExpression();
-                try self.consume(.colon, "Expect ':' after key in dictionary literal");
-                const v = try self.parseExpression();
-                
-                try keys.append(self.builder.allocator, k);
-                try values.append(self.builder.allocator, v);
+            
+            const first = try self.parseExpression();
+            if (self.match(.colon)) {
+                // Dictionary literal
+                const first_val = try self.parseExpression();
+                var keys = std.ArrayList(AST).empty;
+                var values = std.ArrayList(AST).empty;
+                errdefer {
+                    keys.deinit(self.builder.allocator);
+                    values.deinit(self.builder.allocator);
+                }
+                try keys.append(self.builder.allocator, first);
+                try values.append(self.builder.allocator, first_val);
                 
                 if (self.peekType() == .comma) {
                     self.advance();
-                } else if (self.peekType() != .rbrace) {
-                    std.debug.print("parseBase (dict): unexpected token '{s}' ({s}) at line {d}, col {d}\n", .{self.current_token.lexeme, @tagName(self.peekType()), self.current_token.line, self.current_token.column});
-                    return error.ParseError;
                 }
+                
+                while (self.peekType() != .rbrace) {
+                    const k = try self.parseExpression();
+                    try self.consume(.colon, "Expect ':' after key in dictionary literal");
+                    const v = try self.parseExpression();
+                    try keys.append(self.builder.allocator, k);
+                    try values.append(self.builder.allocator, v);
+                    if (self.peekType() == .comma) {
+                        self.advance();
+                    } else if (self.peekType() != .rbrace) {
+                        std.debug.print("parseBase (dict): unexpected token '{s}' ({s}) at line {d}, col {d}\n", .{self.current_token.lexeme, @tagName(self.peekType()), self.current_token.line, self.current_token.column});
+                        return error.ParseError;
+                    }
+                }
+                try self.consume(.rbrace, "Expect '}'");
+                return AST{ .Dict = .{
+                    .keys = try keys.toOwnedSlice(self.builder.allocator),
+                    .values = try values.toOwnedSlice(self.builder.allocator),
+                } };
+            } else {
+                // Set literal: {first, ...}
+                var elts = std.ArrayList(AST).empty;
+                errdefer elts.deinit(self.builder.allocator);
+                try elts.append(self.builder.allocator, first);
+                
+                if (self.peekType() == .comma) {
+                    self.advance();
+                }
+                
+                while (self.peekType() != .rbrace) {
+                    const elt = try self.parseExpression();
+                    try elts.append(self.builder.allocator, elt);
+                    if (self.peekType() == .comma) {
+                        self.advance();
+                    } else if (self.peekType() != .rbrace) {
+                        std.debug.print("parseBase (set): unexpected token '{s}' ({s}) at line {d}, col {d}\n", .{self.current_token.lexeme, @tagName(self.peekType()), self.current_token.line, self.current_token.column});
+                        return error.ParseError;
+                    }
+                }
+                try self.consume(.rbrace, "Expect '}'");
+                return AST{ .Set = .{
+                    .elts = try elts.toOwnedSlice(self.builder.allocator),
+                } };
             }
-            try self.consume(.rbrace, "Expect '}'");
-            return AST{ .Dict = .{
-                .keys = try keys.toOwnedSlice(self.builder.allocator),
-                .values = try values.toOwnedSlice(self.builder.allocator),
-            } };
         }
 
         std.debug.print("parseBase: unexpected token '{s}' ({s}) at line {d}, col {d}\n", .{self.current_token.lexeme, @tagName(self.peekType()), self.current_token.line, self.current_token.column});
@@ -825,7 +1017,34 @@ pub const Parser = struct {
             .name = try self.builder.allocator.dupe(u8, name_tok.lexeme),
             .base = base,
             .body = body,
+            .decorators = &[_]AST{},
         } };
+    }
+
+    fn parseDecoratedDef(self: *Parser) anyerror!AST {
+        var decorators = std.ArrayList(AST).empty;
+        errdefer decorators.deinit(self.builder.allocator);
+        
+        while (self.peekType() == .at) {
+            self.advance(); // consume '@'
+            const dec_expr = try self.parsePrimary();
+            try self.consume(.newline, "Expect newline after decorator");
+            try decorators.append(self.builder.allocator, dec_expr);
+            self.skipNewlines();
+        }
+        
+        if (self.peekType() == .kw_def) {
+            var func = try self.parseFunctionDef();
+            func.FunctionDef.decorators = try decorators.toOwnedSlice(self.builder.allocator);
+            return func;
+        } else if (self.peekType() == .kw_class) {
+            var class_node = try self.parseClassDef();
+            class_node.ClassDef.decorators = try decorators.toOwnedSlice(self.builder.allocator);
+            return class_node;
+        } else {
+            std.debug.print("Error: Expect 'def' or 'class' after decorator\n", .{});
+            return error.ParseError;
+        }
     }
 
     fn parseTryStatement(self: *Parser) anyerror!AST {
@@ -952,6 +1171,38 @@ pub const Parser = struct {
             .names = try names.toOwnedSlice(self.builder.allocator),
         } };
     }
+
+    fn parseWithStatement(self: *Parser) anyerror!AST {
+        try self.consume(.kw_with, "Expect 'with'");
+        
+        var items = std.ArrayList(WithItem).empty;
+        errdefer items.deinit(self.builder.allocator);
+        
+        while (true) {
+            const context_expr = try self.parseExpression();
+            var optional_vars: ?*AST = null;
+            if (self.match(.kw_as)) {
+                const target = try self.parseExpression();
+                optional_vars = try self.builder.newAST(target);
+            }
+            try items.append(self.builder.allocator, .{
+                .context_expr = context_expr,
+                .optional_vars = optional_vars,
+            });
+            if (self.match(.comma)) {
+                continue;
+            }
+            break;
+        }
+        
+        try self.consume(.colon, "Expect ':' after with item(s)");
+        const body = try self.parseBlock();
+        
+        return AST{ .With = .{
+            .items = try items.toOwnedSlice(self.builder.allocator),
+            .body = body,
+        } };
+    }
 };
 
 test "parser simple module, print and math" {
@@ -988,8 +1239,10 @@ test "parser simple module, print and math" {
 
             // Check print
             switch (mod.body[1]) {
-                .Print => |p| {
-                    try testing.expectEqualStrings("x", p.value.*.Name);
+                .Call => |call| {
+                    try testing.expectEqualStrings("print", call.func.*.Name);
+                    try testing.expectEqual(@as(usize, 1), call.args.len);
+                    try testing.expectEqualStrings("x", call.args[0].Name);
                 },
                 else => return error.TestFailed,
             }

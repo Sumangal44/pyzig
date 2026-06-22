@@ -199,6 +199,44 @@ pub fn builtinFloat(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject
     return error.TypeError;
 }
 
+fn toFloatVal(obj: *PyObject) anyerror!f64 {
+    const primitives_mod = @import("../objects/primitives.zig");
+    if (std.mem.eql(u8, obj.type_obj.name, "float")) {
+        return obj.as(primitives_mod.PyFloatObject).value;
+    } else if (std.mem.eql(u8, obj.type_obj.name, "int")) {
+        return @floatFromInt(obj.as(primitives_mod.PyIntObject).value);
+    } else if (std.mem.eql(u8, obj.type_obj.name, "bool")) {
+        return if (obj == primitives_mod.PyTrue) 1.0 else 0.0;
+    } else if (std.mem.eql(u8, obj.type_obj.name, "str")) {
+        const s = obj.as(primitives_mod.PyStringObject).value();
+        return std.fmt.parseFloat(f64, s) catch return error.ValueError;
+    }
+    return error.TypeError;
+}
+
+// complex([real[, imag]])
+pub fn builtinComplex(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    const primitives_mod = @import("../objects/primitives.zig");
+    if (args.len == 0) {
+        return try primitives_mod.PyComplexObject.create(0.0, 0.0, vm.mm);
+    } else if (args.len == 1) {
+        const arg = args[0];
+        if (std.mem.eql(u8, arg.type_obj.name, "complex")) {
+            arg.incRef();
+            return arg;
+        }
+        const real_val = try toFloatVal(arg);
+        return try primitives_mod.PyComplexObject.create(real_val, 0.0, vm.mm);
+    } else if (args.len == 2) {
+        const real_val = try toFloatVal(args[0]);
+        const imag_val = try toFloatVal(args[1]);
+        return try primitives_mod.PyComplexObject.create(real_val, imag_val, vm.mm);
+    }
+    return error.TypeError;
+}
+
 // bool(x)
 pub fn builtinBool(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
     _ = vm_opaque;
@@ -334,6 +372,76 @@ pub fn builtinSum(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
 }
 
 // list(iterable) -> list
+fn iterateIterable(
+    iterable: *PyObject,
+    mm: *PyMemoryManager,
+    context: *anyopaque,
+    callback: *const fn (ctx: *anyopaque, item: *PyObject, mm: *PyMemoryManager) anyerror!void,
+) anyerror!void {
+    const name = iterable.type_obj.name;
+    if (std.mem.eql(u8, name, "list")) {
+        const lst = iterable.as(PyListObject);
+        if (lst.size > 0) {
+            for (lst.items.?[0..lst.size]) |item| {
+                try callback(context, item, mm);
+            }
+        }
+    } else if (std.mem.eql(u8, name, "tuple")) {
+        const tup = iterable.as(PyTupleObject);
+        for (tup.items()) |item| {
+            try callback(context, item, mm);
+        }
+    } else if (std.mem.eql(u8, name, "dict")) {
+        const dict = iterable.as(PyDictObject);
+        for (0..dict.indices_size) |i| {
+            const entry_idx = dict.indices[i];
+            if (entry_idx < 0) continue;
+            const entry = &dict.entries[@intCast(entry_idx)];
+            try callback(context, entry.key.?, mm);
+        }
+    } else if (std.mem.eql(u8, name, "set") or std.mem.eql(u8, name, "frozenset")) {
+        const set_obj = iterable.as(collections.PySetObject);
+        for (0..set_obj.indices_size) |i| {
+            const entry_idx = set_obj.indices[i];
+            if (entry_idx < 0) continue;
+            const entry = &set_obj.entries[@intCast(entry_idx)];
+            try callback(context, entry.key.?, mm);
+        }
+    } else if (std.mem.eql(u8, name, "str")) {
+        const str_val = iterable.as(PyStringObject).value();
+        for (str_val) |c| {
+            const char_str = try PyStringObject.create(&[_]u8{c}, mm);
+            errdefer char_str.decRef(mm);
+            try callback(context, char_str, mm);
+            char_str.decRef(mm);
+        }
+    } else if (std.mem.eql(u8, name, "bytes")) {
+        const bytes_val = iterable.as(primitives.PyBytesObject).value();
+        for (bytes_val) |b| {
+            const int_obj = try PyIntObject.create(b, mm);
+            errdefer int_obj.decRef(mm);
+            try callback(context, int_obj, mm);
+            int_obj.decRef(mm);
+        }
+    } else if (std.mem.eql(u8, name, "bytearray")) {
+        const ba_val = iterable.as(primitives.PyByteArrayObject).value();
+        for (ba_val) |b| {
+            const int_obj = try PyIntObject.create(b, mm);
+            errdefer int_obj.decRef(mm);
+            try callback(context, int_obj, mm);
+            int_obj.decRef(mm);
+        }
+    } else {
+        return error.TypeError;
+    }
+}
+
+fn listAppendCallback(ctx: *anyopaque, item: *PyObject, mm: *PyMemoryManager) anyerror!void {
+    const lst: *PyListObject = @alignCast(@ptrCast(ctx));
+    try lst.append(item, mm);
+}
+
+// list(iterable) -> list
 pub fn builtinList(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
     const VM = @import("../vm/vm.zig").VM;
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
@@ -343,22 +451,10 @@ pub fn builtinList(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject 
     }
     if (args.len != 1) return error.TypeError;
     const obj = args[0];
-    if (std.mem.eql(u8, obj.type_obj.name, "list")) {
-        obj.incRef();
-        return obj;
-    }
-    if (std.mem.eql(u8, obj.type_obj.name, "tuple")) {
-        const tup = obj.as(PyTupleObject);
-        const lst = try PyListObject.create(tup.size, vm.mm);
-        const tup_items = tup.items();
-        for (tup_items[0..tup.size], 0..) |item, i| {
-            item.incRef();
-            lst.items.?[i] = item;
-        }
-        lst.size = tup.size;
-        return &lst.base;
-    }
-    return error.TypeError;
+    const lst = try PyListObject.create(0, vm.mm);
+    errdefer lst.base.decRef(vm.mm);
+    try iterateIterable(obj, vm.mm, lst, listAppendCallback);
+    return &lst.base;
 }
 
 // tuple(iterable) -> tuple
@@ -371,22 +467,147 @@ pub fn builtinTuple(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject
     }
     if (args.len != 1) return error.TypeError;
     const obj = args[0];
-    if (std.mem.eql(u8, obj.type_obj.name, "tuple")) {
-        obj.incRef();
-        return obj;
+    const temp_lst = try PyListObject.create(0, vm.mm);
+    defer temp_lst.base.decRef(vm.mm);
+    try iterateIterable(obj, vm.mm, temp_lst, listAppendCallback);
+    
+    const tup = try PyTupleObject.create(temp_lst.size, vm.mm);
+    const slice = tup.items();
+    for (temp_lst.items.?[0..temp_lst.size], 0..) |item, i| {
+        item.incRef();
+        PyNone.decRef(vm.mm);
+        slice[i] = item;
     }
-    if (std.mem.eql(u8, obj.type_obj.name, "list")) {
-        const lst = obj.as(PyListObject);
-        const tup = try PyTupleObject.create(lst.size, vm.mm);
-        const tup_items = tup.items();
-        for (lst.items.?[0..lst.size], 0..) |item, i| {
-            item.incRef();
-            PyNone.decRef(vm.mm);
-            tup_items[i] = item;
+    return &tup.base;
+}
+
+fn setAddCallback(ctx: *anyopaque, item: *PyObject, mm: *PyMemoryManager) anyerror!void {
+    const set_obj: *collections.PySetObject = @alignCast(@ptrCast(ctx));
+    try set_obj.add(item, mm);
+}
+
+// set(iterable) -> set
+pub fn builtinSet(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len == 0) {
+        const set_obj = try collections.PySetObject.create(vm.mm);
+        return &set_obj.base;
+    }
+    if (args.len != 1) return error.TypeError;
+    const obj = args[0];
+    const set_obj = try collections.PySetObject.create(vm.mm);
+    errdefer set_obj.base.decRef(vm.mm);
+    try iterateIterable(obj, vm.mm, set_obj, setAddCallback);
+    return &set_obj.base;
+}
+
+// frozenset(iterable) -> frozenset
+pub fn builtinFrozenSet(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len == 0) {
+        const set_obj = try collections.PySetObject.createFrozen(vm.mm);
+        return &set_obj.base;
+    }
+    if (args.len != 1) return error.TypeError;
+    const obj = args[0];
+    const set_obj = try collections.PySetObject.createFrozen(vm.mm);
+    errdefer set_obj.base.decRef(vm.mm);
+    try iterateIterable(obj, vm.mm, set_obj, setAddCallback);
+    return &set_obj.base;
+}
+
+fn bytesAppendCallback(ctx: *anyopaque, item: *PyObject, mm: *PyMemoryManager) anyerror!void {
+    const list_bytes: *std.ArrayList(u8) = @alignCast(@ptrCast(ctx));
+    if (!std.mem.eql(u8, item.type_obj.name, "int")) {
+        return error.TypeError;
+    }
+    const val = item.as(PyIntObject).value;
+    if (val < 0 or val > 255) {
+        return error.ValueError;
+    }
+    try list_bytes.append(mm.allocator, @intCast(val));
+}
+
+// bytes() -> bytes
+pub fn builtinBytes(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len == 0) {
+        return try primitives.PyBytesObject.create("", vm.mm);
+    }
+    if (args.len > 1) return error.TypeError;
+    const obj = args[0];
+    
+    if (std.mem.eql(u8, obj.type_obj.name, "int")) {
+        const len_val = obj.as(PyIntObject).value;
+        if (len_val < 0) return error.ValueError;
+        const ulen: usize = @intCast(len_val);
+        const buf = try vm.mm.allocator.alloc(u8, ulen);
+        defer vm.mm.allocator.free(buf);
+        @memset(buf, 0);
+        return try primitives.PyBytesObject.create(buf, vm.mm);
+    } else if (std.mem.eql(u8, obj.type_obj.name, "str")) {
+        const s = obj.as(PyStringObject).value();
+        return try primitives.PyBytesObject.create(s, vm.mm);
+    } else {
+        var list_bytes = std.ArrayList(u8).empty;
+        defer list_bytes.deinit(vm.mm.allocator);
+        try iterateIterable(obj, vm.mm, &list_bytes, bytesAppendCallback);
+        return try primitives.PyBytesObject.create(list_bytes.items, vm.mm);
+    }
+}
+
+fn bytearrayAppendCallback(ctx: *anyopaque, item: *PyObject, mm: *PyMemoryManager) anyerror!void {
+    const ba: *primitives.PyByteArrayObject = @alignCast(@ptrCast(ctx));
+    if (!std.mem.eql(u8, item.type_obj.name, "int")) {
+        return error.TypeError;
+    }
+    const val = item.as(PyIntObject).value;
+    if (val < 0 or val > 255) {
+        return error.ValueError;
+    }
+    try ba.append(@intCast(val), mm);
+}
+
+// bytearray() -> bytearray
+pub fn builtinByteArray(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len == 0) {
+        const ba = try primitives.PyByteArrayObject.create(0, vm.mm);
+        return &ba.base;
+    }
+    if (args.len > 1) return error.TypeError;
+    const obj = args[0];
+    
+    if (std.mem.eql(u8, obj.type_obj.name, "int")) {
+        const len_val = obj.as(PyIntObject).value;
+        if (len_val < 0) return error.ValueError;
+        const ulen: usize = @intCast(len_val);
+        const ba = try primitives.PyByteArrayObject.create(ulen, vm.mm);
+        errdefer ba.base.decRef(vm.mm);
+        if (ulen > 0) {
+            @memset(ba.items.?[0..ulen], 0);
+            ba.size = ulen;
         }
-        return &tup.base;
+        return &ba.base;
+    } else if (std.mem.eql(u8, obj.type_obj.name, "str")) {
+        const s = obj.as(PyStringObject).value();
+        const ba = try primitives.PyByteArrayObject.create(s.len, vm.mm);
+        errdefer ba.base.decRef(vm.mm);
+        if (s.len > 0) {
+            @memcpy(ba.items.?[0..s.len], s);
+            ba.size = s.len;
+        }
+        return &ba.base;
+    } else {
+        const ba = try primitives.PyByteArrayObject.create(0, vm.mm);
+        errdefer ba.base.decRef(vm.mm);
+        try iterateIterable(obj, vm.mm, ba, bytearrayAppendCallback);
+        return &ba.base;
     }
-    return error.TypeError;
 }
 
 // dict() -> empty dict
@@ -397,6 +618,7 @@ pub fn builtinDict(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject 
     const d = try PyDictObject.create(vm.mm);
     return &d.base;
 }
+
 
 // input([prompt]) -> str
 pub fn builtinInput(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
@@ -1012,4 +1234,109 @@ pub fn builtinHash(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject 
         return try PyIntObject.create(h, vm.mm);
     }
 }
+
+pub fn setAddMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 2) return error.TypeError;
+    const self_obj = args[0];
+    const key = args[1];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "set")) return error.TypeError;
+    try self_obj.as(collections.PySetObject).add(key, vm.mm);
+    PyNone.incRef();
+    return PyNone;
+}
+
+pub fn setRemoveMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 2) return error.TypeError;
+    const self_obj = args[0];
+    const key = args[1];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "set")) return error.TypeError;
+    const removed = try self_obj.as(collections.PySetObject).remove(key, vm.mm);
+    if (!removed) return error.KeyError;
+    PyNone.incRef();
+    return PyNone;
+}
+
+pub fn setDiscardMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 2) return error.TypeError;
+    const self_obj = args[0];
+    const key = args[1];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "set")) return error.TypeError;
+    _ = try self_obj.as(collections.PySetObject).remove(key, vm.mm);
+    PyNone.incRef();
+    return PyNone;
+}
+
+pub fn listAppendMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 2) return error.TypeError;
+    const self_obj = args[0];
+    const item = args[1];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    try self_obj.as(collections.PyListObject).append(item, vm.mm);
+    PyNone.incRef();
+    return PyNone;
+}
+
+pub fn bytearrayAppendMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 2) return error.TypeError;
+    const self_obj = args[0];
+    const item = args[1];
+    if (!std.mem.eql(u8, self_obj.type_obj.name, "bytearray")) return error.TypeError;
+    if (!std.mem.eql(u8, item.type_obj.name, "int")) return error.TypeError;
+    const val = item.as(PyIntObject).value;
+    if (val < 0 or val > 255) return error.ValueError;
+    try self_obj.as(primitives.PyByteArrayObject).append(@intCast(val), vm.mm);
+    PyNone.incRef();
+    return PyNone;
+}
+
+pub fn builtinNext(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len < 1 or args.len > 2) return error.TypeError;
+    
+    const iterable = args[0];
+    const default_val = if (args.len == 2) args[1] else null;
+    
+    if (std.mem.eql(u8, iterable.type_obj.name, "generator")) {
+        const gen = iterable.as(@import("../objects/function.zig").PyGeneratorObject);
+        if (gen.is_closed) {
+            if (default_val) |dv| {
+                dv.incRef();
+                return dv;
+            }
+            return error.StopIteration;
+        }
+        
+        const prev_frame_count = vm.frame_count;
+        
+        vm.frames[vm.frame_count] = gen.frame;
+        vm.frame_count += 1;
+        
+        try vm.runLoop(prev_frame_count);
+        
+        if (gen.is_closed) {
+            if (default_val) |dv| {
+                dv.incRef();
+                return dv;
+            }
+            return error.StopIteration;
+        }
+        
+        const caller_frame = &vm.frames[vm.frame_count - 1];
+        return caller_frame.pop();
+    } else {
+        return error.TypeError;
+    }
+}
+
 

@@ -11,6 +11,16 @@ test_files = [
     "test_phase3.py",
     "test_comprehensive.py",
     "test_keyword.py",
+    "test_kw_print.py",
+    "test_complex.py",
+    "test_bytes.py",
+    "test_set.py",
+    "test_bitwise.py",
+    "test_walrus.py",
+    "test_decorators.py",
+    "test_with.py",
+    "test_generators.py",
+    "test_nonlocal.py",
     "benchmark.py"
 ]
 

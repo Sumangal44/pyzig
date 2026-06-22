@@ -11,7 +11,9 @@ const PyTrue = primitives.PyTrue;
 const PyFalse = primitives.PyFalse;
 const PyIntObject = primitives.PyIntObject;
 const PyFloatObject = primitives.PyFloatObject;
+const PyComplexObject = primitives.PyComplexObject;
 const PyStringObject = primitives.PyStringObject;
+const PyBytesObject = primitives.PyBytesObject;
 const PyInt_Type = primitives.PyInt_Type;
 const PyFloat_Type = primitives.PyFloat_Type;
 const PyString_Type = primitives.PyString_Type;
@@ -33,6 +35,7 @@ pub const Compiler = struct {
     locals: std.StringHashMap(void),
     varnames: std.ArrayList([]const u8),
     is_function: bool = false,
+    is_generator: bool = false,
     parent: ?*Compiler = null,
     // Loop context for break/continue
     loop_start_stack: std.ArrayList(usize),
@@ -50,6 +53,7 @@ pub const Compiler = struct {
             .locals = std.StringHashMap(void).init(allocator),
             .varnames = std.ArrayList([]const u8).empty,
             .is_function = false,
+            .is_generator = false,
             .parent = null,
             .loop_start_stack = std.ArrayList(usize).empty,
             .loop_break_patches = std.ArrayList(std.ArrayList(usize)).empty,
@@ -199,6 +203,78 @@ pub const Compiler = struct {
         return @intCast(self.names.items.len - 1);
     }
 
+    fn preScanExpr(self: *Compiler, node: *const AST) anyerror!void {
+        switch (node.*) {
+            .NamedExpr => |ne| {
+                if (!self.globals_set.contains(ne.target)) {
+                    try self.locals.put(ne.target, {});
+                }
+                try self.preScanExpr(ne.value);
+            },
+            .BinOp => |bin| {
+                try self.preScanExpr(bin.left);
+                try self.preScanExpr(bin.right);
+            },
+            .UnaryOp => |un| {
+                try self.preScanExpr(un.operand);
+            },
+            .Compare => |cmp| {
+                try self.preScanExpr(cmp.left);
+                try self.preScanExpr(cmp.right);
+            },
+            .Call => |call| {
+                try self.preScanExpr(call.func);
+                for (call.args) |*arg| {
+                    try self.preScanExpr(arg);
+                }
+            },
+            .List => |lst| {
+                for (lst.elts) |*elt| {
+                    try self.preScanExpr(elt);
+                }
+            },
+            .Tuple => |tup| {
+                for (tup.elts) |*elt| {
+                    try self.preScanExpr(elt);
+                }
+            },
+            .Set => |set| {
+                for (set.elts) |*elt| {
+                    try self.preScanExpr(elt);
+                }
+            },
+            .Dict => |dict| {
+                for (dict.keys, 0..) |*key, i| {
+                    try self.preScanExpr(key);
+                    try self.preScanExpr(&dict.values[i]);
+                }
+            },
+            .Attribute => |attr| {
+                try self.preScanExpr(attr.value);
+            },
+            .Subscript => |sub| {
+                try self.preScanExpr(sub.value);
+                try self.preScanExpr(sub.index);
+            },
+            .Yield => |y| {
+                if (y.value) |val| {
+                    try self.preScanExpr(val);
+                }
+            },
+            .YieldFrom => |yf| {
+                try self.preScanExpr(yf.value);
+            },
+            .Await => |aw| {
+                try self.preScanExpr(aw.value);
+            },
+            .LogicalOp => |log| {
+                try self.preScanExpr(log.left);
+                try self.preScanExpr(log.right);
+            },
+            else => {},
+        }
+    }
+
     fn preScanLocals(self: *Compiler, body: []const AST) anyerror!void {
         for (body) |stmt| {
             switch (stmt) {
@@ -206,22 +282,31 @@ pub const Compiler = struct {
                     if (!self.globals_set.contains(assign.target)) {
                         try self.locals.put(assign.target, {});
                     }
+                    try self.preScanExpr(assign.value);
                 },
                 .AugAssign => |aug| {
                     if (!self.globals_set.contains(aug.target)) {
                         try self.locals.put(aug.target, {});
                     }
+                    try self.preScanExpr(aug.value);
                 },
                 .FunctionDef => |func| {
                     try self.locals.put(func.name, {});
+                    for (func.decorators) |*dec| {
+                        try self.preScanExpr(dec);
+                    }
                 },
                 .ClassDef => |class_def| {
                     try self.locals.put(class_def.name, {});
+                    for (class_def.decorators) |*dec| {
+                        try self.preScanExpr(dec);
+                    }
                 },
                 .For => |for_node| {
                     if (!self.globals_set.contains(for_node.target)) {
                         try self.locals.put(for_node.target, {});
                     }
+                    try self.preScanExpr(for_node.iter);
                     try self.preScanLocals(for_node.body);
                 },
                 .Try => |try_node| {
@@ -235,18 +320,41 @@ pub const Compiler = struct {
                     try self.preScanLocals(try_node.finalbody);
                 },
                 .If => |if_node| {
+                    try self.preScanExpr(if_node.cond);
                     try self.preScanLocals(if_node.body);
                     try self.preScanLocals(if_node.orelse_body);
                 },
                 .While => |while_node| {
+                    try self.preScanExpr(while_node.cond);
                     try self.preScanLocals(while_node.body);
+                },
+                .With => |with_node| {
+                    for (with_node.items) |item| {
+                        try self.preScanExpr(&item.context_expr);
+                        if (item.optional_vars) |vars| {
+                            try self.preScanExpr(vars);
+                        }
+                    }
+                    try self.preScanLocals(with_node.body);
+                },
+                .Return => |ret| {
+                    if (ret.value) |val| {
+                        try self.preScanExpr(val);
+                    }
+                },
+                .Raise => |raise_node| {
+                    if (raise_node.exc) |exc| {
+                        try self.preScanExpr(exc);
+                    }
                 },
                 .Global => |global_node| {
                     for (global_node.names) |name| {
                         try self.globals_set.put(name, {});
                     }
                 },
-                else => {},
+                else => {
+                    try self.preScanExpr(&stmt);
+                },
             }
         }
     }
@@ -330,6 +438,12 @@ pub const Compiler = struct {
                     .Mod => Opcode.BINARY_MOD,
                     .Pow => Opcode.BINARY_POW,
                     .FloorDiv => Opcode.BINARY_FLOOR_DIV,
+                    .And => Opcode.BINARY_AND,
+                    .Or => Opcode.BINARY_OR,
+                    .Xor => Opcode.BINARY_XOR,
+                    .LShift => Opcode.BINARY_LSHIFT,
+                    .RShift => Opcode.BINARY_RSHIFT,
+                    .MatMul => Opcode.BINARY_MATRIX_MULTIPLY,
                 };
                 try self.instructions.append(self.allocator, .{ .op = op });
                 try self.emitStore(aug.target);
@@ -345,6 +459,12 @@ pub const Compiler = struct {
                     .Mod => Opcode.BINARY_MOD,
                     .Pow => Opcode.BINARY_POW,
                     .FloorDiv => Opcode.BINARY_FLOOR_DIV,
+                    .And => Opcode.BINARY_AND,
+                    .Or => Opcode.BINARY_OR,
+                    .Xor => Opcode.BINARY_XOR,
+                    .LShift => Opcode.BINARY_LSHIFT,
+                    .RShift => Opcode.BINARY_RSHIFT,
+                    .MatMul => Opcode.BINARY_MATRIX_MULTIPLY,
                 };
                 try self.instructions.append(self.allocator, .{ .op = op });
             },
@@ -372,9 +492,14 @@ pub const Compiler = struct {
                     },
                     .Int => |i| try PyIntObject.create(i, self.mm),
                     .Float => |f_val| try PyFloatObject.create(f_val, self.mm),
+                    .Complex => |c| try PyComplexObject.create(c.real, c.imag, self.mm),
                     .String => |s| blk: {
                         const processed = try self.processEscapes(s);
                         break :blk try PyStringObject.create(processed, self.mm);
+                    },
+                    .Bytes => |b| blk: {
+                        const processed = try self.processEscapes(b);
+                        break :blk try PyBytesObject.create(processed, self.mm);
                     },
                 };
                 const const_idx = try self.addConst(obj);
@@ -507,7 +632,18 @@ pub const Compiler = struct {
                 }
                 try self.instructions.append(self.allocator, .{ .op = .BUILD_MAP, .arg = @intCast(dict_node.keys.len) });
             },
+            .Set => |set_node| {
+                for (set_node.elts) |*elt| {
+                    try self.compileAST(elt);
+                }
+                try self.instructions.append(self.allocator, .{ .op = .BUILD_SET, .arg = @intCast(set_node.elts.len) });
+            },
             .FunctionDef => |func_def| {
+                // Compile decorators first (top-to-bottom)
+                for (func_def.decorators) |*dec| {
+                    try self.compileAST(dec);
+                }
+
                 var child_compiler = Compiler.init(self.mm.allocator, self.mm);
                 child_compiler.parent = self;
                 child_compiler.is_function = true;
@@ -553,12 +689,21 @@ pub const Compiler = struct {
                     .names = try child_compiler.names.toOwnedSlice(self.mm.allocator),
                     .argcount = func_def.args.len,
                     .varnames = child_varnames,
+                    .is_generator = child_compiler.is_generator,
                 };
                 
                 const wrapper = try PyCodeObjectWrapper.create(code_obj, self.mm);
                 const const_idx = try self.addConst(wrapper);
                 try self.instructions.append(self.allocator, .{ .op = .LOAD_CONST, .arg = const_idx });
                 try self.instructions.append(self.allocator, .{ .op = .MAKE_FUNCTION });
+                
+                // If decorators are present, apply them in reverse order
+                var i: usize = func_def.decorators.len;
+                while (i > 0) {
+                    i -= 1;
+                    try self.instructions.append(self.allocator, .{ .op = .CALL, .arg = 1 });
+                }
+
                 try self.emitStore(func_def.name);
             },
             .Lambda => |lambda_node| {
@@ -594,6 +739,7 @@ pub const Compiler = struct {
                     .names = try child_compiler.names.toOwnedSlice(self.mm.allocator),
                     .argcount = lambda_node.args.len,
                     .varnames = child_varnames,
+                    .is_generator = child_compiler.is_generator,
                 };
                 
                 const wrapper_obj = try PyCodeObjectWrapper.create(code_obj, self.mm);
@@ -620,6 +766,11 @@ pub const Compiler = struct {
             },
             .Pass => {},
             .ClassDef => |class_def| {
+                // Compile decorators first (top-to-bottom)
+                for (class_def.decorators) |*dec| {
+                    try self.compileAST(dec);
+                }
+
                 const build_class_idx = try self.addName("__build_class__");
                 try self.instructions.append(self.allocator, .{ .op = .LOAD_NAME, .arg = build_class_idx });
                 
@@ -665,6 +816,13 @@ pub const Compiler = struct {
                 
                 try self.instructions.append(self.allocator, .{ .op = .CALL, .arg = argc });
                 
+                // If decorators are present, apply them in reverse order
+                var i: usize = class_def.decorators.len;
+                while (i > 0) {
+                    i -= 1;
+                    try self.instructions.append(self.allocator, .{ .op = .CALL, .arg = 1 });
+                }
+
                 try self.emitStore(class_def.name);
             },
             .Attribute => |attr_node| {
@@ -853,8 +1011,53 @@ pub const Compiler = struct {
                 const op = switch (unop.op) {
                     .Not => Opcode.UNARY_NOT,
                     .Neg => Opcode.UNARY_NEG,
+                    .Invert => Opcode.UNARY_INVERT,
                 };
                 try self.instructions.append(self.allocator, .{ .op = op });
+            },
+            .NamedExpr => |ne| {
+                try self.compileAST(ne.value);
+                try self.emitStore(ne.target);
+                try self.emitLoad(ne.target);
+            },
+            .Yield => |y| {
+                self.is_generator = true;
+                if (y.value) |val| {
+                    try self.compileAST(val);
+                } else {
+                    const py_none = @import("../objects/primitives.zig").PyNone;
+                    py_none.incRef();
+                    const const_idx = try self.addConst(py_none);
+                    try self.instructions.append(self.allocator, .{ .op = .LOAD_CONST, .arg = const_idx });
+                }
+                try self.instructions.append(self.allocator, .{ .op = .YIELD_VALUE });
+            },
+            .YieldFrom => |yf| {
+                self.is_generator = true;
+                try self.compileAST(yf.value);
+                try self.instructions.append(self.allocator, .{ .op = .YIELD_VALUE });
+            },
+            .With => |with_node| {
+                for (with_node.items) |item| {
+                    try self.compileAST(&item.context_expr);
+                    try self.instructions.append(self.allocator, .{ .op = .BEFORE_WITH });
+                    if (item.optional_vars) |vars| {
+                        switch (vars.*) {
+                            .Name => |n| try self.emitStore(n),
+                            else => unreachable,
+                        }
+                    } else {
+                        try self.instructions.append(self.allocator, .{ .op = .POP_TOP });
+                    }
+                }
+                for (with_node.body) |*stmt| {
+                    try self.compileAST(stmt);
+                }
+                try self.instructions.append(self.allocator, .{ .op = .EXIT_WITH });
+                try self.instructions.append(self.allocator, .{ .op = .POP_TOP });
+            },
+            .Await => |a| {
+                try self.compileAST(a.value);
             },
         }
     }
@@ -932,7 +1135,15 @@ pub const Compiler = struct {
                     try self.resolveScopesAST(&dict_node.values[i]);
                 }
             },
+            .Set => |set_node| {
+                for (set_node.elts) |*elt| {
+                    try self.resolveScopesAST(elt);
+                }
+            },
             .FunctionDef => |func_def| {
+                for (func_def.decorators) |*dec| {
+                    try self.resolveScopesAST(dec);
+                }
                 var child_compiler = Compiler.init(self.allocator, self.mm);
                 child_compiler.parent = self;
                 child_compiler.is_function = true;
@@ -959,6 +1170,9 @@ pub const Compiler = struct {
                 }
             },
             .ClassDef => |class_def| {
+                for (class_def.decorators) |*dec| {
+                    try self.resolveScopesAST(dec);
+                }
                 var child_compiler = Compiler.init(self.allocator, self.mm);
                 child_compiler.parent = self;
                 child_compiler.is_function = false;
@@ -1029,6 +1243,32 @@ pub const Compiler = struct {
             },
             .UnaryOp => |unop| {
                 try self.resolveScopesAST(unop.operand);
+            },
+            .NamedExpr => |ne| {
+                try self.resolveScopesAST(ne.value);
+                _ = try self.checkEnclosingScope(ne.target);
+            },
+            .Yield => |y| {
+                if (y.value) |val| {
+                    try self.resolveScopesAST(val);
+                }
+            },
+            .YieldFrom => |yf| {
+                try self.resolveScopesAST(yf.value);
+            },
+            .With => |with_node| {
+                for (with_node.items) |item| {
+                    try self.resolveScopesAST(&item.context_expr);
+                    if (item.optional_vars) |vars| {
+                        try self.resolveScopesAST(vars);
+                    }
+                }
+                for (with_node.body) |*stmt| {
+                    try self.resolveScopesAST(stmt);
+                }
+            },
+            .Await => |a| {
+                try self.resolveScopesAST(a.value);
             },
         }
     }
