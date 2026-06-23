@@ -50,6 +50,12 @@ pub const WithItem = struct {
     optional_vars: ?*AST,
 };
 
+pub const Comprehension = struct {
+    target: []const u8, // loop variable (identifier)
+    iter: *AST,         // iterable expression
+    ifs: []AST,         // filter conditions
+};
+
 pub const AST = union(enum) {
     Module: struct {
         body: []AST,
@@ -202,6 +208,23 @@ pub const AST = union(enum) {
     ImportFrom: struct {
         module: []const u8,
         names: [][]const u8,
+    },
+    ListComp: struct {
+        elt: *AST,
+        generators: []Comprehension,
+    },
+    SetComp: struct {
+        elt: *AST,
+        generators: []Comprehension,
+    },
+    DictComp: struct {
+        key: *AST,
+        value: *AST,
+        generators: []Comprehension,
+    },
+    GeneratorExp: struct {
+        elt: *AST,
+        generators: []Comprehension,
     },
     LogicalOp: struct {
         op: enum { And, Or },

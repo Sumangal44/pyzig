@@ -3,6 +3,7 @@ const testing = std.testing;
 const AST = @import("../ast/ast.zig").AST;
 const Op = @import("../ast/ast.zig").Op;
 const CompareOp = @import("../ast/ast.zig").CompareOp;
+const Comprehension = @import("../ast/ast.zig").Comprehension;
 const PyObject = @import("../objects/object.zig").PyObject;
 const PyMemoryManager = @import("../memory/allocator.zig").PyMemoryManager;
 const primitives = @import("../objects/primitives.zig");
@@ -270,6 +271,44 @@ pub const Compiler = struct {
             .LogicalOp => |log| {
                 try self.preScanExpr(log.left);
                 try self.preScanExpr(log.right);
+            },
+            .ListComp => |lc| {
+                // The loop variable in comprehensions is local
+                for (lc.generators) |gen| {
+                    if (!self.globals_set.contains(gen.target)) {
+                        try self.locals.put(gen.target, {});
+                    }
+                    try self.preScanExpr(gen.iter);
+                }
+                try self.preScanExpr(lc.elt);
+            },
+            .SetComp => |sc| {
+                for (sc.generators) |gen| {
+                    if (!self.globals_set.contains(gen.target)) {
+                        try self.locals.put(gen.target, {});
+                    }
+                    try self.preScanExpr(gen.iter);
+                }
+                try self.preScanExpr(sc.elt);
+            },
+            .DictComp => |dc| {
+                for (dc.generators) |gen| {
+                    if (!self.globals_set.contains(gen.target)) {
+                        try self.locals.put(gen.target, {});
+                    }
+                    try self.preScanExpr(gen.iter);
+                }
+                try self.preScanExpr(dc.key);
+                try self.preScanExpr(dc.value);
+            },
+            .GeneratorExp => |ge| {
+                for (ge.generators) |gen| {
+                    if (!self.globals_set.contains(gen.target)) {
+                        try self.locals.put(gen.target, {});
+                    }
+                    try self.preScanExpr(gen.iter);
+                }
+                try self.preScanExpr(ge.elt);
             },
             .Expr => |e| {
                 try self.preScanExpr(e.value);
@@ -1080,11 +1119,261 @@ pub const Compiler = struct {
                 try self.instructions.append(self.allocator, .{ .op = .EXIT_WITH });
                 try self.instructions.append(self.allocator, .{ .op = .POP_TOP });
             },
+            .ListComp => |lc| {
+                try self.compileComprehension(lc.elt, null, null, lc.generators, .list);
+            },
+            .SetComp => |sc| {
+                try self.compileComprehension(sc.elt, null, null, sc.generators, .set);
+            },
+            .DictComp => |dc| {
+                try self.compileComprehension(dc.key, dc.value, null, dc.generators, .dict);
+            },
+            .GeneratorExp => |ge| {
+                try self.compileGeneratorExpr(ge.elt, ge.generators);
+            },
             .Await => |a| {
                 try self.compileAST(a.value);
             },
             .Slice => {},
         }
+    }
+
+    const CompMode = enum { list, set, dict };
+
+    fn compileComprehension(
+        self: *Compiler,
+        elt: *const AST,
+        key_ast: ?*const AST,
+        val_ast: ?*const AST,
+        generators: []const Comprehension,
+        comptime mode: CompMode,
+    ) anyerror!void {
+        // Inline compilation of comprehension as a nested loop
+        // For list: create empty list, then nested for/if loops appending
+        // For set: create empty set, then nested for/if loops adding
+        // For dict: create empty dict, then nested for/if loops setting
+
+        // Create the result container
+        switch (mode) {
+            .list => {
+                try self.instructions.append(self.allocator, .{ .op = .BUILD_LIST, .arg = 0 });
+            },
+            .set => {
+                try self.instructions.append(self.allocator, .{ .op = .BUILD_SET, .arg = 0 });
+            },
+            .dict => {
+                try self.instructions.append(self.allocator, .{ .op = .BUILD_MAP, .arg = 0 });
+            },
+        }
+
+        // We use the LOAD_NAME/STORE_NAME approach for simplicity with a known temp name
+        const result_var = "__comp_result__";
+        // Need to ensure __comp_result__ is registered as a local if in function scope
+        if (self.is_function) {
+            try self.locals.put(result_var, {});
+        }
+        try self.emitStore(result_var);
+
+        // Track loop starts for each generator level for break/continue
+        var loop_starts = std.ArrayList(usize).empty;
+        defer loop_starts.deinit(self.allocator);
+
+        // Compile nested for/if loops (innermost first? No, outermost first)
+        try self.compileComprehensionGenerators(generators, 0, elt, key_ast, val_ast, mode, &loop_starts);
+
+        // Load and return the result
+        try self.emitLoad(result_var);
+    }
+
+    fn compileComprehensionGenerators(
+        self: *Compiler,
+        generators: []const Comprehension,
+        gen_idx: usize,
+        elt: *const AST,
+        key_ast: ?*const AST,
+        val_ast: ?*const AST,
+        comptime mode: CompMode,
+        loop_starts: *std.ArrayList(usize),
+    ) anyerror!void {
+        if (gen_idx >= generators.len) {
+            // Innermost: compile the value expression and append/add/setitem
+            switch (mode) {
+                .list => {
+                    try self.compileAST(elt);
+                    try self.emitLoad("__comp_result__");
+                    const append_idx = try self.addName("append");
+                    try self.instructions.append(self.allocator, .{ .op = .LOAD_ATTR, .arg = append_idx });
+                    try self.instructions.append(self.allocator, .{ .op = .CALL, .arg = 1 });
+                    try self.instructions.append(self.allocator, .{ .op = .POP_TOP });
+                },
+                .set => {
+                    try self.compileAST(elt);
+                    try self.emitLoad("__comp_result__");
+                    const add_idx = try self.addName("add");
+                    try self.instructions.append(self.allocator, .{ .op = .LOAD_ATTR, .arg = add_idx });
+                    try self.instructions.append(self.allocator, .{ .op = .CALL, .arg = 1 });
+                    try self.instructions.append(self.allocator, .{ .op = .POP_TOP });
+                },
+                .dict => {
+                    try self.emitLoad("__comp_result__");
+                    try self.compileAST(key_ast.?);
+                    try self.compileAST(val_ast.?);
+                    try self.instructions.append(self.allocator, .{ .op = .STORE_SUBSCR });
+                },
+            }
+            return;
+        }
+
+        const gen = generators[gen_idx];
+        const target = gen.target;
+
+        // Compile the iterable
+        try self.compileAST(gen.iter);
+        try self.instructions.append(self.allocator, .{ .op = .GET_ITER });
+
+        const loop_start = self.instructions.items.len;
+        try loop_starts.append(self.allocator, loop_start);
+
+        try self.instructions.append(self.allocator, .{ .op = .FOR_ITER, .arg = 0 });
+        const for_iter_idx = self.instructions.items.len - 1;
+
+        try self.emitStore(target);
+
+        // Collect patch points for if conditions
+        var if_patches = std.ArrayList(usize).empty;
+        defer if_patches.deinit(self.allocator);
+
+        for (gen.ifs) |*if_cond| {
+            try self.compileAST(if_cond);
+            const patch_idx = self.instructions.items.len;
+            try self.instructions.append(self.allocator, .{ .op = .POP_JUMP_IF_FALSE, .arg = 0 });
+            try if_patches.append(self.allocator, patch_idx);
+        }
+
+        // Compile body (nested generators) after all if conditions pass
+        try self.compileComprehensionGenerators(generators, gen_idx + 1, elt, key_ast, val_ast, mode, loop_starts);
+
+        // Patch all if-false jumps to jump here
+        for (if_patches.items) |patch_idx| {
+            self.instructions.items[patch_idx].arg = @intCast(self.instructions.items.len);
+        }
+
+        // Jump back to FOR_ITER
+        try self.instructions.append(self.allocator, .{ .op = .JUMP_BACKWARD, .arg = @intCast(loop_start) });
+
+        // Patch FOR_ITER jump target
+        self.instructions.items[for_iter_idx].arg = @intCast(self.instructions.items.len);
+
+        // Pop the exhausted iterator
+        try self.instructions.append(self.allocator, .{ .op = .POP_TOP });
+
+        _ = loop_starts.pop();
+    }
+
+    fn compileGeneratorExpr(self: *Compiler, elt: *const AST, generators: []const Comprehension) anyerror!void {
+        // Generator expressions are compiled as nested generator functions
+        // We create a child compiler that generates a generator function
+
+        var child_compiler = Compiler.init(self.mm.allocator, self.mm);
+        child_compiler.parent = self;
+        child_compiler.is_function = true;
+        child_compiler.is_generator = true;
+        defer child_compiler.deinit();
+
+        // Appload the result to a local variable
+        const result_var = "__gen_result__";
+        try child_compiler.locals.put(result_var, {});
+
+        // All generator loop vars are locals
+        for (generators) |gen| {
+            try child_compiler.locals.put(gen.target, {});
+        }
+
+        // Generate the nested loops with yields
+        try child_compiler.compileGeneratorBody(elt, generators, 0);
+
+        // Implicit return (generator will close)
+        PyNone.incRef();
+        const none_idx = try child_compiler.addConst(PyNone);
+        try child_compiler.instructions.append(child_compiler.allocator, .{ .op = .LOAD_CONST, .arg = none_idx });
+        try child_compiler.instructions.append(child_compiler.allocator, .{ .op = .RETURN_VALUE });
+
+        // Create code object
+        const code_obj = try self.mm.allocator.create(PyCodeObject);
+        errdefer self.mm.allocator.destroy(code_obj);
+
+        var child_varnames = try self.mm.allocator.alloc([]const u8, child_compiler.varnames.items.len);
+        errdefer {
+            for (child_varnames) |name| self.mm.allocator.free(name);
+            self.mm.allocator.free(child_varnames);
+        }
+        for (child_compiler.varnames.items, 0..) |vname, i| {
+            child_varnames[i] = try self.mm.allocator.dupe(u8, vname);
+        }
+
+        code_obj.* = PyCodeObject{
+            .instructions = try child_compiler.instructions.toOwnedSlice(self.mm.allocator),
+            .consts = try child_compiler.consts.toOwnedSlice(self.mm.allocator),
+            .names = try child_compiler.names.toOwnedSlice(self.mm.allocator),
+            .argcount = 0,
+            .varnames = child_varnames,
+            .is_generator = true,
+        };
+
+        const wrapper = try PyCodeObjectWrapper.create(code_obj, self.mm);
+        const const_idx = try self.addConst(wrapper);
+        try self.instructions.append(self.allocator, .{ .op = .LOAD_CONST, .arg = const_idx });
+        try self.instructions.append(self.allocator, .{ .op = .MAKE_FUNCTION });
+        try self.instructions.append(self.allocator, .{ .op = .CALL, .arg = 0 });
+    }
+
+    fn compileGeneratorBody(
+        self: *Compiler,
+        elt: *const AST,
+        generators: []const Comprehension,
+        gen_idx: usize,
+    ) anyerror!void {
+        if (gen_idx >= generators.len) {
+            // Innermost: yield the expression
+            try self.compileAST(elt);
+            try self.instructions.append(self.allocator, .{ .op = .YIELD_VALUE });
+            return;
+        }
+
+        const gen = generators[gen_idx];
+
+        // Compile iterable
+        try self.compileAST(gen.iter);
+        try self.instructions.append(self.allocator, .{ .op = .GET_ITER });
+
+        const loop_start = self.instructions.items.len;
+        try self.instructions.append(self.allocator, .{ .op = .FOR_ITER, .arg = 0 });
+        const for_iter_idx = self.instructions.items.len - 1;
+
+        try self.emitStore(gen.target);
+
+        // Collect patch points for if filters
+        var if_patches = std.ArrayList(usize).empty;
+        defer if_patches.deinit(self.allocator);
+
+        for (gen.ifs) |*if_cond| {
+            try self.compileAST(if_cond);
+            const patch_idx = self.instructions.items.len;
+            try self.instructions.append(self.allocator, .{ .op = .POP_JUMP_IF_FALSE, .arg = 0 });
+            try if_patches.append(self.allocator, patch_idx);
+        }
+
+        // Compile body after all if conditions pass
+        try self.compileGeneratorBody(elt, generators, gen_idx + 1);
+
+        // Patch all if-false jumps
+        for (if_patches.items) |patch_idx| {
+            self.instructions.items[patch_idx].arg = @intCast(self.instructions.items.len);
+        }
+
+        try self.instructions.append(self.allocator, .{ .op = .JUMP_BACKWARD, .arg = @intCast(loop_start) });
+        self.instructions.items[for_iter_idx].arg = @intCast(self.instructions.items.len);
+        try self.instructions.append(self.allocator, .{ .op = .POP_TOP });
     }
 
     fn resolveFunctionScopes(self: *Compiler, body: []const AST) anyerror!void {
@@ -1294,6 +1583,46 @@ pub const Compiler = struct {
             },
             .Await => |a| {
                 try self.resolveScopesAST(a.value);
+            },
+            .ListComp => |lc| {
+                for (lc.generators) |gen| {
+                    try self.resolveScopesAST(gen.iter);
+                    _ = try self.checkEnclosingScope(gen.target);
+                    for (gen.ifs) |*if_cond| {
+                        try self.resolveScopesAST(if_cond);
+                    }
+                }
+                try self.resolveScopesAST(lc.elt);
+            },
+            .SetComp => |sc| {
+                for (sc.generators) |gen| {
+                    try self.resolveScopesAST(gen.iter);
+                    _ = try self.checkEnclosingScope(gen.target);
+                    for (gen.ifs) |*if_cond| {
+                        try self.resolveScopesAST(if_cond);
+                    }
+                }
+                try self.resolveScopesAST(sc.elt);
+            },
+            .DictComp => |dc| {
+                for (dc.generators) |gen| {
+                    try self.resolveScopesAST(gen.iter);
+                    _ = try self.checkEnclosingScope(gen.target);
+                    for (gen.ifs) |*if_cond| {
+                        try self.resolveScopesAST(if_cond);
+                    }
+                }
+                try self.resolveScopesAST(dc.key);
+                try self.resolveScopesAST(dc.value);
+            },
+            .GeneratorExp => |ge| {
+                for (ge.generators) |gen| {
+                    try self.resolveScopesAST(gen.iter);
+                    for (gen.ifs) |*if_cond| {
+                        try self.resolveScopesAST(if_cond);
+                    }
+                }
+                try self.resolveScopesAST(ge.elt);
             },
             .Expr => |e| {
                 try self.resolveScopesAST(e.value);

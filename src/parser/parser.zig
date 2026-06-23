@@ -9,6 +9,7 @@ const Op = @import("../ast/ast.zig").Op;
 const CompareOp = @import("../ast/ast.zig").CompareOp;
 const ExceptHandler = @import("../ast/ast.zig").ExceptHandler;
 const WithItem = @import("../ast/ast.zig").WithItem;
+const Comprehension = @import("../ast/ast.zig").Comprehension;
 
 pub const Parser = struct {
     lexer: *Lexer,
@@ -790,6 +791,42 @@ pub const Parser = struct {
         return expr;
     }
 
+    fn parseComprehensionGenerators(self: *Parser) anyerror![]Comprehension {
+        var generators = std.ArrayList(Comprehension).empty;
+        errdefer {
+            for (generators.items) |gen| {
+                self.builder.allocator.free(gen.target);
+                self.builder.allocator.free(gen.ifs);
+            }
+            generators.deinit(self.builder.allocator);
+        }
+
+        while (true) {
+            try self.consume(.kw_for, "Expect 'for' in comprehension");
+            const target = try self.builder.allocator.dupe(u8, self.current_token.lexeme);
+            try self.consume(.identifier, "Expect loop variable in comprehension");
+            try self.consume(.kw_in, "Expect 'in' in comprehension");
+            const iter = try self.parseExpression();
+
+            var ifs = std.ArrayList(AST).empty;
+            errdefer ifs.deinit(self.builder.allocator);
+            while (self.match(.kw_if)) {
+                const cond = try self.parseExpression();
+                try ifs.append(self.builder.allocator, cond);
+            }
+
+            try generators.append(self.builder.allocator, .{
+                .target = target,
+                .iter = try self.builder.newAST(iter),
+                .ifs = try ifs.toOwnedSlice(self.builder.allocator),
+            });
+
+            if (self.peekType() != .kw_for) break;
+        }
+
+        return try generators.toOwnedSlice(self.builder.allocator);
+    }
+
     fn parseBase(self: *Parser) anyerror!AST {
         if (self.match(.kw_None)) {
             return AST{ .Constant = .None };
@@ -833,16 +870,28 @@ pub const Parser = struct {
             return AST{ .Name = name };
         }
 
-        // List literal: [1, 2, 3]
+        // List literal or comprehension: [1, 2, 3] or [x for x in items]
         if (self.match(.lbracket)) {
+            const first = try self.parseExpression();
+            // Check for list comprehension: [expr for ...]
+            if (self.peekType() == .kw_for) {
+                const generators = try self.parseComprehensionGenerators();
+                try self.consume(.rbracket, "Expect ']' after list comprehension");
+                return AST{ .ListComp = .{
+                    .elt = try self.builder.newAST(first),
+                    .generators = generators,
+                } };
+            }
             var elts = std.ArrayList(AST).empty;
             errdefer elts.deinit(self.builder.allocator);
+            try elts.append(self.builder.allocator, first);
             while (self.peekType() != .rbracket) {
-                const elt = try self.parseExpression();
-                try elts.append(self.builder.allocator, elt);
                 if (self.peekType() == .comma) {
                     self.advance();
-                } else if (self.peekType() != .rbracket) {
+                    if (self.peekType() == .rbracket) break;
+                    const elt = try self.parseExpression();
+                    try elts.append(self.builder.allocator, elt);
+                } else {
                     std.debug.print("parseBase (list): unexpected token '{s}' ({s}) at line {d}, col {d}\n", .{self.current_token.lexeme, @tagName(self.peekType()), self.current_token.line, self.current_token.column});
                     return error.ParseError;
                 }
@@ -851,12 +900,21 @@ pub const Parser = struct {
             return AST{ .List = .{ .elts = try elts.toOwnedSlice(self.builder.allocator) } };
         }
 
-        // Tuple literal or grouped expression
+        // Tuple literal, grouped expression, or generator expression
         if (self.match(.lparen)) {
             if (self.match(.rparen)) {
                 return AST{ .Tuple = .{ .elts = &[_]AST{} } };
             }
             const first = try self.parseExpression();
+            // Check for generator expression: (expr for ...)
+            if (self.peekType() == .kw_for) {
+                const generators = try self.parseComprehensionGenerators();
+                try self.consume(.rparen, "Expect ')' after generator expression");
+                return AST{ .GeneratorExp = .{
+                    .elt = try self.builder.newAST(first),
+                    .generators = generators,
+                } };
+            }
             if (self.match(.comma)) {
                 var elts = std.ArrayList(AST).empty;
                 errdefer elts.deinit(self.builder.allocator);
@@ -879,7 +937,7 @@ pub const Parser = struct {
             }
         }
 
-        // Dict or Set literal: { ... }
+        // Dict/Set literal or comprehension: { ... }
         if (self.match(.lbrace)) {
             if (self.peekType() == .rbrace) {
                 try self.consume(.rbrace, "Expect '}'");
@@ -891,8 +949,17 @@ pub const Parser = struct {
             
             const first = try self.parseExpression();
             if (self.match(.colon)) {
-                // Dictionary literal
+                // Dict literal or dict comprehension: {k: v} or {k: v for ...}
                 const first_val = try self.parseExpression();
+                if (self.peekType() == .kw_for) {
+                    const generators = try self.parseComprehensionGenerators();
+                    try self.consume(.rbrace, "Expect '}' after dict comprehension");
+                    return AST{ .DictComp = .{
+                        .key = try self.builder.newAST(first),
+                        .value = try self.builder.newAST(first_val),
+                        .generators = generators,
+                    } };
+                }
                 var keys = std.ArrayList(AST).empty;
                 var values = std.ArrayList(AST).empty;
                 errdefer {
@@ -925,7 +992,15 @@ pub const Parser = struct {
                     .values = try values.toOwnedSlice(self.builder.allocator),
                 } };
             } else {
-                // Set literal: {first, ...}
+                // Set literal/comprehension: {first, ...} or {expr for ...}
+                if (self.peekType() == .kw_for) {
+                    const generators = try self.parseComprehensionGenerators();
+                    try self.consume(.rbrace, "Expect '}' after set comprehension");
+                    return AST{ .SetComp = .{
+                        .elt = try self.builder.newAST(first),
+                        .generators = generators,
+                    } };
+                }
                 var elts = std.ArrayList(AST).empty;
                 errdefer elts.deinit(self.builder.allocator);
                 try elts.append(self.builder.allocator, first);

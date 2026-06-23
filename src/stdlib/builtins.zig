@@ -8,11 +8,23 @@ const PyTrue = primitives.PyTrue;
 const PyFalse = primitives.PyFalse;
 const PyIntObject = primitives.PyIntObject;
 const PyStringObject = primitives.PyStringObject;
+const PyInt_Type = primitives.PyInt_Type;
+const PyFloat_Type = primitives.PyFloat_Type;
+const PyString_Type = primitives.PyString_Type;
+const PyBool_Type = primitives.PyBool_Type;
+const PyComplex_Type = primitives.PyComplex_Type;
+const PyBytes_Type = primitives.PyBytes_Type;
+const PyByteArray_Type = primitives.PyByteArray_Type;
 const PyBuiltinFunctionObject = @import("../objects/function.zig").PyBuiltinFunctionObject;
 const collections = @import("../objects/collections.zig");
 const PyListObject = collections.PyListObject;
 const PyTupleObject = collections.PyTupleObject;
 const PyDictObject = collections.PyDictObject;
+const PyList_Type = collections.PyList_Type;
+const PyTuple_Type = collections.PyTuple_Type;
+const PyDict_Type = collections.PyDict_Type;
+const PySet_Type = collections.PySet_Type;
+const PyFrozenSet_Type = collections.PyFrozenSet_Type;
 
 pub const PyTypeWrapper = extern struct {
     base: PyObject,
@@ -55,13 +67,13 @@ pub fn builtinLen(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
     
     const obj = args[0];
     var size: usize = 0;
-    if (std.mem.eql(u8, obj.type_obj.name, "list")) {
+    if (obj.type_obj == &PyList_Type) {
         size = obj.as(PyListObject).size;
-    } else if (std.mem.eql(u8, obj.type_obj.name, "tuple")) {
+    } else if (obj.type_obj == &PyTuple_Type) {
         size = obj.as(PyTupleObject).size;
-    } else if (std.mem.eql(u8, obj.type_obj.name, "dict")) {
+    } else if (obj.type_obj == &PyDict_Type) {
         size = obj.as(PyDictObject).active_count;
-    } else if (std.mem.eql(u8, obj.type_obj.name, "str")) {
+    } else if (obj.type_obj == &PyString_Type) {
         size = obj.as(PyStringObject).len;
     } else {
         return error.TypeError;
@@ -94,11 +106,11 @@ pub fn builtinRange(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject
     var start: i64 = 0;
     var stop: i64 = 0;
     if (args.len == 1) {
-        if (!std.mem.eql(u8, args[0].type_obj.name, "int")) return error.TypeError;
+        if (args[0].type_obj != &PyInt_Type) return error.TypeError;
         stop = args[0].as(PyIntObject).value;
     } else {
-        if (!std.mem.eql(u8, args[0].type_obj.name, "int")) return error.TypeError;
-        if (!std.mem.eql(u8, args[1].type_obj.name, "int")) return error.TypeError;
+        if (args[0].type_obj != &PyInt_Type) return error.TypeError;
+        if (args[1].type_obj != &PyInt_Type) return error.TypeError;
         start = args[0].as(PyIntObject).value;
         stop = args[1].as(PyIntObject).value;
     }
@@ -161,17 +173,17 @@ pub fn builtinInt(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
     if (args.len != 1) return error.TypeError;
     const obj = args[0];
-    if (std.mem.eql(u8, obj.type_obj.name, "int")) {
+    if (obj.type_obj == &PyInt_Type) {
         obj.incRef();
         return obj;
-    } else if (std.mem.eql(u8, obj.type_obj.name, "float")) {
+    } else if (obj.type_obj == &PyFloat_Type) {
         const val: i64 = @intFromFloat(obj.as(@import("../objects/primitives.zig").PyFloatObject).value);
         return try PyIntObject.create(val, vm.mm);
-    } else if (std.mem.eql(u8, obj.type_obj.name, "str")) {
+    } else if (obj.type_obj == &PyString_Type) {
         const s = obj.as(PyStringObject).value();
         const val = std.fmt.parseInt(i64, s, 10) catch return error.ValueError;
         return try PyIntObject.create(val, vm.mm);
-    } else if (std.mem.eql(u8, obj.type_obj.name, "bool")) {
+    } else if (obj.type_obj == &PyBool_Type) {
         const bval = obj == PyTrue;
         return try PyIntObject.create(if (bval) 1 else 0, vm.mm);
     }
@@ -185,13 +197,13 @@ pub fn builtinFloat(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject
     if (args.len != 1) return error.TypeError;
     const obj = args[0];
     const primitives_mod = @import("../objects/primitives.zig");
-    if (std.mem.eql(u8, obj.type_obj.name, "float")) {
+    if (obj.type_obj == &PyFloat_Type) {
         obj.incRef();
         return obj;
-    } else if (std.mem.eql(u8, obj.type_obj.name, "int")) {
+    } else if (obj.type_obj == &PyInt_Type) {
         const val: f64 = @floatFromInt(obj.as(PyIntObject).value);
         return try primitives_mod.PyFloatObject.create(val, vm.mm);
-    } else if (std.mem.eql(u8, obj.type_obj.name, "str")) {
+    } else if (obj.type_obj == &PyString_Type) {
         const s = obj.as(PyStringObject).value();
         const val = std.fmt.parseFloat(f64, s) catch return error.ValueError;
         return try primitives_mod.PyFloatObject.create(val, vm.mm);
@@ -201,13 +213,13 @@ pub fn builtinFloat(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject
 
 fn toFloatVal(obj: *PyObject) anyerror!f64 {
     const primitives_mod = @import("../objects/primitives.zig");
-    if (std.mem.eql(u8, obj.type_obj.name, "float")) {
+    if (obj.type_obj == &PyFloat_Type) {
         return obj.as(primitives_mod.PyFloatObject).value;
-    } else if (std.mem.eql(u8, obj.type_obj.name, "int")) {
+    } else if (obj.type_obj == &PyInt_Type) {
         return @floatFromInt(obj.as(primitives_mod.PyIntObject).value);
-    } else if (std.mem.eql(u8, obj.type_obj.name, "bool")) {
+    } else if (obj.type_obj == &PyBool_Type) {
         return if (obj == primitives_mod.PyTrue) 1.0 else 0.0;
-    } else if (std.mem.eql(u8, obj.type_obj.name, "str")) {
+    } else if (obj.type_obj == &PyString_Type) {
         const s = obj.as(primitives_mod.PyStringObject).value();
         return std.fmt.parseFloat(f64, s) catch return error.ValueError;
     }
@@ -223,7 +235,7 @@ pub fn builtinComplex(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObje
         return try primitives_mod.PyComplexObject.create(0.0, 0.0, vm.mm);
     } else if (args.len == 1) {
         const arg = args[0];
-        if (std.mem.eql(u8, arg.type_obj.name, "complex")) {
+        if (arg.type_obj == &PyComplex_Type) {
             arg.incRef();
             return arg;
         }
@@ -251,13 +263,13 @@ pub fn builtinBool(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject 
         PyFalse.incRef();
         return PyFalse;
     }
-    if (std.mem.eql(u8, obj.type_obj.name, "int")) {
+    if (obj.type_obj == &PyInt_Type) {
         const v = obj.as(PyIntObject).value;
         const res = if (v != 0) PyTrue else PyFalse;
         res.incRef();
         return res;
     }
-    if (std.mem.eql(u8, obj.type_obj.name, "str")) {
+    if (obj.type_obj == &PyString_Type) {
         const s = obj.as(PyStringObject).value();
         const res = if (s.len > 0) PyTrue else PyFalse;
         res.incRef();
@@ -273,12 +285,12 @@ pub fn builtinAbs(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
     if (args.len != 1) return error.TypeError;
     const obj = args[0];
-    if (std.mem.eql(u8, obj.type_obj.name, "int")) {
+    if (obj.type_obj == &PyInt_Type) {
         const v = obj.as(PyIntObject).value;
         return try PyIntObject.create(if (v < 0) -v else v, vm.mm);
     }
     const primitives_mod = @import("../objects/primitives.zig");
-    if (std.mem.eql(u8, obj.type_obj.name, "float")) {
+    if (obj.type_obj == &PyFloat_Type) {
         const v = obj.as(primitives_mod.PyFloatObject).value;
         return try primitives_mod.PyFloatObject.create(if (v < 0) -v else v, vm.mm);
     }
@@ -291,7 +303,7 @@ pub fn builtinMax(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
     if (args.len == 0) return error.TypeError;
     // If single list argument, treat elements as args
-    if (args.len == 1 and std.mem.eql(u8, args[0].type_obj.name, "list")) {
+    if (args.len == 1 and args[0].type_obj == &PyList_Type) {
         const lst = args[0].as(PyListObject);
         if (lst.size == 0) return error.ValueError;
         var best = lst.items.?[0];
@@ -324,7 +336,7 @@ pub fn builtinMin(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
     const VM = @import("../vm/vm.zig").VM;
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
     if (args.len == 0) return error.TypeError;
-    if (args.len == 1 and std.mem.eql(u8, args[0].type_obj.name, "list")) {
+    if (args.len == 1 and args[0].type_obj == &PyList_Type) {
         const lst = args[0].as(PyListObject);
         if (lst.size == 0) return error.ValueError;
         var best = lst.items.?[0];
@@ -358,10 +370,10 @@ pub fn builtinSum(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
     if (args.len < 1) return error.TypeError;
     const iterable = args[0];
-    if (!std.mem.eql(u8, iterable.type_obj.name, "list")) return error.TypeError;
+    if (iterable.type_obj != &PyList_Type) return error.TypeError;
     const lst = iterable.as(PyListObject);
     var total: i64 = 0;
-    if (args.len >= 2 and std.mem.eql(u8, args[1].type_obj.name, "int")) {
+    if (args.len >= 2 and args[1].type_obj == &PyInt_Type) {
         total = args[1].as(PyIntObject).value;
     }
     for (lst.items.?[0..lst.size]) |item| {
@@ -520,7 +532,7 @@ pub fn builtinFrozenSet(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyOb
 
 fn bytesAppendCallback(ctx: *anyopaque, item: *PyObject, mm: *PyMemoryManager) anyerror!void {
     const list_bytes: *std.ArrayList(u8) = @alignCast(@ptrCast(ctx));
-    if (!std.mem.eql(u8, item.type_obj.name, "int")) {
+    if (item.type_obj != &PyInt_Type) {
         return error.TypeError;
     }
     const val = item.as(PyIntObject).value;
@@ -540,7 +552,7 @@ pub fn builtinBytes(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject
     if (args.len > 1) return error.TypeError;
     const obj = args[0];
     
-    if (std.mem.eql(u8, obj.type_obj.name, "int")) {
+    if (obj.type_obj == &PyInt_Type) {
         const len_val = obj.as(PyIntObject).value;
         if (len_val < 0) return error.ValueError;
         const ulen: usize = @intCast(len_val);
@@ -548,7 +560,7 @@ pub fn builtinBytes(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject
         defer vm.mm.allocator.free(buf);
         @memset(buf, 0);
         return try primitives.PyBytesObject.create(buf, vm.mm);
-    } else if (std.mem.eql(u8, obj.type_obj.name, "str")) {
+    } else if (obj.type_obj == &PyString_Type) {
         const s = obj.as(PyStringObject).value();
         return try primitives.PyBytesObject.create(s, vm.mm);
     } else {
@@ -561,7 +573,7 @@ pub fn builtinBytes(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject
 
 fn bytearrayAppendCallback(ctx: *anyopaque, item: *PyObject, mm: *PyMemoryManager) anyerror!void {
     const ba: *primitives.PyByteArrayObject = @alignCast(@ptrCast(ctx));
-    if (!std.mem.eql(u8, item.type_obj.name, "int")) {
+    if (item.type_obj != &PyInt_Type) {
         return error.TypeError;
     }
     const val = item.as(PyIntObject).value;
@@ -582,7 +594,7 @@ pub fn builtinByteArray(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyOb
     if (args.len > 1) return error.TypeError;
     const obj = args[0];
     
-    if (std.mem.eql(u8, obj.type_obj.name, "int")) {
+    if (obj.type_obj == &PyInt_Type) {
         const len_val = obj.as(PyIntObject).value;
         if (len_val < 0) return error.ValueError;
         const ulen: usize = @intCast(len_val);
@@ -593,7 +605,7 @@ pub fn builtinByteArray(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyOb
             ba.size = ulen;
         }
         return &ba.base;
-    } else if (std.mem.eql(u8, obj.type_obj.name, "str")) {
+    } else if (obj.type_obj == &PyString_Type) {
         const s = obj.as(PyStringObject).value();
         const ba = try primitives.PyByteArrayObject.create(s.len, vm.mm);
         errdefer ba.base.decRef(vm.mm);
@@ -902,7 +914,7 @@ pub fn builtinEnumerate(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyOb
     const iterable = args[0];
     var start: i64 = 0;
     if (args.len == 2) {
-        if (!std.mem.eql(u8, args[1].type_obj.name, "int")) return error.TypeError;
+        if (args[1].type_obj != &PyInt_Type) return error.TypeError;
         start = args[1].as(PyIntObject).value;
     }
     
@@ -1201,7 +1213,7 @@ pub fn builtinRound(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject
     const num = args[0];
     var ndigits: i64 = 0;
     if (args.len == 2) {
-        if (!std.mem.eql(u8, args[1].type_obj.name, "int")) return error.TypeError;
+        if (args[1].type_obj != &PyInt_Type) return error.TypeError;
         ndigits = args[1].as(PyIntObject).value;
     }
     
@@ -1241,7 +1253,7 @@ pub fn setAddMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject
     if (args.len != 2) return error.TypeError;
     const self_obj = args[0];
     const key = args[1];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "set")) return error.TypeError;
+    if (self_obj.type_obj != &PySet_Type) return error.TypeError;
     try self_obj.as(collections.PySetObject).add(key, vm.mm);
     PyNone.incRef();
     return PyNone;
@@ -1253,7 +1265,7 @@ pub fn setRemoveMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObj
     if (args.len != 2) return error.TypeError;
     const self_obj = args[0];
     const key = args[1];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "set")) return error.TypeError;
+    if (self_obj.type_obj != &PySet_Type) return error.TypeError;
     const removed = try self_obj.as(collections.PySetObject).remove(key, vm.mm);
     if (!removed) return error.KeyError;
     PyNone.incRef();
@@ -1266,7 +1278,7 @@ pub fn setDiscardMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyOb
     if (args.len != 2) return error.TypeError;
     const self_obj = args[0];
     const key = args[1];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "set")) return error.TypeError;
+    if (self_obj.type_obj != &PySet_Type) return error.TypeError;
     _ = try self_obj.as(collections.PySetObject).remove(key, vm.mm);
     PyNone.incRef();
     return PyNone;
@@ -1278,7 +1290,7 @@ pub fn listAppendMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyOb
     if (args.len != 2) return error.TypeError;
     const self_obj = args[0];
     const item = args[1];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    if (self_obj.type_obj != &PyList_Type) return error.TypeError;
     try self_obj.as(collections.PyListObject).append(item, vm.mm);
     PyNone.incRef();
     return PyNone;
@@ -1291,7 +1303,7 @@ pub fn listInsertMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyOb
     const self_obj = args[0];
     const index = args[1];
     const item = args[2];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    if (self_obj.type_obj != &PyList_Type) return error.TypeError;
     if (!std.mem.eql(u8, index.type_obj.name, "int")) return error.TypeError;
     try self_obj.as(collections.PyListObject).insert(index.as(PyIntObject).value, item, vm.mm);
     PyNone.incRef();
@@ -1304,11 +1316,11 @@ pub fn listPopMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObjec
     _ = vm;
     if (args.len < 1 or args.len > 2) return error.TypeError;
     const self_obj = args[0];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    if (self_obj.type_obj != &PyList_Type) return error.TypeError;
     const self = self_obj.as(collections.PyListObject);
     if (self.size == 0) return error.IndexError;
     const index: ?i64 = if (args.len == 2) blk: {
-        if (!std.mem.eql(u8, args[1].type_obj.name, "int")) return error.TypeError;
+        if (args[1].type_obj != &PyInt_Type) return error.TypeError;
         break :blk args[1].as(PyIntObject).value;
     } else null;
     return self.pop(index);
@@ -1320,7 +1332,7 @@ pub fn listRemoveMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyOb
     if (args.len != 2) return error.TypeError;
     const self_obj = args[0];
     const item = args[1];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    if (self_obj.type_obj != &PyList_Type) return error.TypeError;
     try self_obj.as(collections.PyListObject).remove(item, vm.mm);
     PyNone.incRef();
     return PyNone;
@@ -1332,7 +1344,7 @@ pub fn listIndexMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObj
     if (args.len != 2) return error.TypeError;
     const self_obj = args[0];
     const item = args[1];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    if (self_obj.type_obj != &PyList_Type) return error.TypeError;
     const idx = try self_obj.as(collections.PyListObject).index(item, vm.mm);
     return try PyIntObject.create(idx, vm.mm);
 }
@@ -1343,7 +1355,7 @@ pub fn listCountMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObj
     if (args.len != 2) return error.TypeError;
     const self_obj = args[0];
     const item = args[1];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    if (self_obj.type_obj != &PyList_Type) return error.TypeError;
     const cnt = try self_obj.as(collections.PyListObject).count(item, vm.mm);
     return try PyIntObject.create(cnt, vm.mm);
 }
@@ -1354,7 +1366,7 @@ pub fn listReverseMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyO
     _ = vm;
     if (args.len != 1) return error.TypeError;
     const self_obj = args[0];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    if (self_obj.type_obj != &PyList_Type) return error.TypeError;
     self_obj.as(collections.PyListObject).reverse();
     PyNone.incRef();
     return PyNone;
@@ -1365,7 +1377,7 @@ pub fn listSortMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObje
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
     if (args.len != 1) return error.TypeError;
     const self_obj = args[0];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    if (self_obj.type_obj != &PyList_Type) return error.TypeError;
     try self_obj.as(collections.PyListObject).sort(vm.mm);
     PyNone.incRef();
     return PyNone;
@@ -1377,7 +1389,7 @@ pub fn listExtendMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyOb
     if (args.len != 2) return error.TypeError;
     const self_obj = args[0];
     const iterable = args[1];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    if (self_obj.type_obj != &PyList_Type) return error.TypeError;
     try self_obj.as(collections.PyListObject).extend(iterable, vm.mm);
     PyNone.incRef();
     return PyNone;
@@ -1388,7 +1400,7 @@ pub fn listClearMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObj
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
     if (args.len != 1) return error.TypeError;
     const self_obj = args[0];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "list")) return error.TypeError;
+    if (self_obj.type_obj != &PyList_Type) return error.TypeError;
     self_obj.as(collections.PyListObject).clear(vm.mm);
     PyNone.incRef();
     return PyNone;
@@ -1399,7 +1411,7 @@ pub fn dictKeysMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObje
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
     if (args.len != 1) return error.TypeError;
     const self_obj = args[0];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "dict")) return error.TypeError;
+    if (self_obj.type_obj != &PyDict_Type) return error.TypeError;
     const result = try self_obj.as(collections.PyDictObject).keys(vm.mm);
     return &result.base;
 }
@@ -1409,7 +1421,7 @@ pub fn dictValuesMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyOb
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
     if (args.len != 1) return error.TypeError;
     const self_obj = args[0];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "dict")) return error.TypeError;
+    if (self_obj.type_obj != &PyDict_Type) return error.TypeError;
     const result = try self_obj.as(collections.PyDictObject).values(vm.mm);
     return &result.base;
 }
@@ -1419,7 +1431,7 @@ pub fn dictItemsMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObj
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
     if (args.len != 1) return error.TypeError;
     const self_obj = args[0];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "dict")) return error.TypeError;
+    if (self_obj.type_obj != &PyDict_Type) return error.TypeError;
     const result = try self_obj.as(collections.PyDictObject).items(vm.mm);
     return &result.base;
 }
@@ -1430,7 +1442,7 @@ pub fn dictGetMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObjec
     if (args.len < 2 or args.len > 3) return error.TypeError;
     const self_obj = args[0];
     const key = args[1];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "dict")) return error.TypeError;
+    if (self_obj.type_obj != &PyDict_Type) return error.TypeError;
     if (self_obj.as(collections.PyDictObject).get(key, vm.mm)) |val| {
         val.incRef();
         return val;
@@ -1449,7 +1461,7 @@ pub fn dictPopMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObjec
     if (args.len < 2 or args.len > 3) return error.TypeError;
     const self_obj = args[0];
     const key = args[1];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "dict")) return error.TypeError;
+    if (self_obj.type_obj != &PyDict_Type) return error.TypeError;
     const result = self_obj.as(collections.PyDictObject).dictPop(key, vm.mm) catch |err| {
         if (err == error.KeyError and args.len == 3) {
             args[2].incRef();
@@ -1466,7 +1478,7 @@ pub fn dictUpdateMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyOb
     if (args.len != 2) return error.TypeError;
     const self_obj = args[0];
     const other = args[1];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "dict")) return error.TypeError;
+    if (self_obj.type_obj != &PyDict_Type) return error.TypeError;
     if (!std.mem.eql(u8, other.type_obj.name, "dict")) return error.TypeError;
     try self_obj.as(collections.PyDictObject).update(other.as(collections.PyDictObject), vm.mm);
     PyNone.incRef();
@@ -1478,7 +1490,7 @@ pub fn dictClearMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObj
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
     if (args.len != 1) return error.TypeError;
     const self_obj = args[0];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "dict")) return error.TypeError;
+    if (self_obj.type_obj != &PyDict_Type) return error.TypeError;
     self_obj.as(collections.PyDictObject).clear(vm.mm);
     PyNone.incRef();
     return PyNone;
@@ -1489,7 +1501,7 @@ pub fn dictCopyMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObje
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
     if (args.len != 1) return error.TypeError;
     const self_obj = args[0];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "dict")) return error.TypeError;
+    if (self_obj.type_obj != &PyDict_Type) return error.TypeError;
     const result = try self_obj.as(collections.PyDictObject).copy(vm.mm);
     return &result.base;
 }
@@ -1499,7 +1511,7 @@ pub fn stringSplitMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyO
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
     if (args.len < 1 or args.len > 2) return error.TypeError;
     const self_obj = args[0];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "str")) return error.TypeError;
+    if (self_obj.type_obj != &PyString_Type) return error.TypeError;
     const self = self_obj.as(PyStringObject);
     const s = self.value();
 
@@ -1550,7 +1562,7 @@ pub fn stringJoinMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyOb
     if (args.len != 2) return error.TypeError;
     const self_obj = args[0];
     const iterable = args[1];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "str")) return error.TypeError;
+    if (self_obj.type_obj != &PyString_Type) return error.TypeError;
     if (!std.mem.eql(u8, iterable.type_obj.name, "list")) return error.TypeError;
     const self = self_obj.as(PyStringObject);
     const sep = self.value();
@@ -1583,7 +1595,7 @@ pub fn stringReplaceMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*P
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
     if (args.len < 3 or args.len > 4) return error.TypeError;
     const self_obj = args[0];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "str")) return error.TypeError;
+    if (self_obj.type_obj != &PyString_Type) return error.TypeError;
     const old_obj = args[1];
     const new_obj = args[2];
     if (!std.mem.eql(u8, old_obj.type_obj.name, "str")) return error.TypeError;
@@ -1625,7 +1637,7 @@ pub fn stringStripMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyO
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
     if (args.len < 1 or args.len > 2) return error.TypeError;
     const self_obj = args[0];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "str")) return error.TypeError;
+    if (self_obj.type_obj != &PyString_Type) return error.TypeError;
     const self = self_obj.as(PyStringObject);
     const s = self.value();
 
@@ -1654,7 +1666,7 @@ pub fn stringLowerMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyO
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
     if (args.len != 1) return error.TypeError;
     const self_obj = args[0];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "str")) return error.TypeError;
+    if (self_obj.type_obj != &PyString_Type) return error.TypeError;
     const self = self_obj.as(PyStringObject);
     const s = self.value();
 
@@ -1672,7 +1684,7 @@ pub fn stringUpperMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyO
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
     if (args.len != 1) return error.TypeError;
     const self_obj = args[0];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "str")) return error.TypeError;
+    if (self_obj.type_obj != &PyString_Type) return error.TypeError;
     const self = self_obj.as(PyStringObject);
     const s = self.value();
 
@@ -1691,7 +1703,7 @@ pub fn stringStartsWithMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror
     _ = vm;
     if (args.len != 2) return error.TypeError;
     const self_obj = args[0];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "str")) return error.TypeError;
+    if (self_obj.type_obj != &PyString_Type) return error.TypeError;
     const prefix_obj = args[1];
     if (!std.mem.eql(u8, prefix_obj.type_obj.name, "str")) return error.TypeError;
     const self = self_obj.as(PyStringObject);
@@ -1707,7 +1719,7 @@ pub fn stringEndsWithMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*
     _ = vm;
     if (args.len != 2) return error.TypeError;
     const self_obj = args[0];
-    if (!std.mem.eql(u8, self_obj.type_obj.name, "str")) return error.TypeError;
+    if (self_obj.type_obj != &PyString_Type) return error.TypeError;
     const suffix_obj = args[1];
     if (!std.mem.eql(u8, suffix_obj.type_obj.name, "str")) return error.TypeError;
     const self = self_obj.as(PyStringObject);
@@ -1715,6 +1727,20 @@ pub fn stringEndsWithMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*
     const s = self.value();
     if (suffix.len > s.len) return PyFalse;
     return if (std.mem.eql(u8, s[s.len - suffix.len ..], suffix)) PyTrue else PyFalse;
+}
+
+pub fn builtinProperty(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    const PyPropertyObject = @import("../objects/property.zig").PyPropertyObject;
+
+    const fget = if (args.len >= 1) args[0] else null;
+    const fset = if (args.len >= 2) args[1] else null;
+    const fdel = if (args.len >= 3) args[2] else null;
+    const doc = if (args.len >= 4) args[3] else null;
+
+    const prop = try PyPropertyObject.create(fget, fset, fdel, doc, vm.mm);
+    return &prop.base;
 }
 
 pub fn bytearrayAppendMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {

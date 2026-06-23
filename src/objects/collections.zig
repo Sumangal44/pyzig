@@ -230,7 +230,7 @@ pub const PyListObject = extern struct {
     }
 
     pub fn extend(self: *PyListObject, iterable: *PyObject, mm: *PyMemoryManager) !void {
-        if (std.mem.eql(u8, iterable.type_obj.name, "list")) {
+        if (iterable.type_obj == &PyList_Type) {
             const other = iterable.as(PyListObject);
             const new_size = self.size + other.size;
             try self.ensureCapacity(new_size, mm);
@@ -243,7 +243,7 @@ pub const PyListObject = extern struct {
             self.size = new_size;
             return;
         }
-        if (std.mem.eql(u8, iterable.type_obj.name, "tuple")) {
+        if (iterable.type_obj == &PyTuple_Type) {
             const other = iterable.as(PyTupleObject);
             const other_items = other.items();
             const new_size = self.size + other_items.len;
