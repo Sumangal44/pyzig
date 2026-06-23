@@ -32,14 +32,14 @@ pub const PySliceObject = extern struct {
 
     pub fn computeIndices(self: *PySliceObject, length: i64) struct { start: i64, stop: i64, step: i64 } {
         const step = if (self.step) |s| blk: {
-            if (std.mem.eql(u8, s.type_obj.name, "int")) {
+            if (s.type_obj == &primitives.PyInt_Type) {
                 break :blk s.as(PyIntObject).value;
             }
             break :blk 1;
         } else 1;
 
         const start = if (self.start) |s| blk: {
-            if (std.mem.eql(u8, s.type_obj.name, "int")) {
+            if (s.type_obj == &primitives.PyInt_Type) {
                 var v = s.as(PyIntObject).value;
                 if (v < 0) v += length;
                 if (v < 0) v = 0;
@@ -50,7 +50,7 @@ pub const PySliceObject = extern struct {
         } else if (step > 0) 0 else length - 1;
 
         const stop = if (self.stop) |s| blk: {
-            if (std.mem.eql(u8, s.type_obj.name, "int")) {
+            if (s.type_obj == &primitives.PyInt_Type) {
                 var v = s.as(PyIntObject).value;
                 if (v < 0) v += length;
                 if (v < 0) v = 0;
