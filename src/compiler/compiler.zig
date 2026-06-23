@@ -845,7 +845,24 @@ pub const Compiler = struct {
             },
             .Subscript => |sub| {
                 try self.compileAST(sub.value);
-                try self.compileAST(sub.index);
+                if (sub.index.* == .Slice) {
+                    const slice = sub.index.Slice;
+                    if (slice.start) |s| try self.compileAST(s) else {
+                        const none_idx = try self.addConst(PyNone);
+                        try self.instructions.append(self.allocator, .{ .op = .LOAD_CONST, .arg = none_idx });
+                    }
+                    if (slice.stop) |s| try self.compileAST(s) else {
+                        const none_idx = try self.addConst(PyNone);
+                        try self.instructions.append(self.allocator, .{ .op = .LOAD_CONST, .arg = none_idx });
+                    }
+                    if (slice.step) |s| try self.compileAST(s) else {
+                        const none_idx = try self.addConst(PyNone);
+                        try self.instructions.append(self.allocator, .{ .op = .LOAD_CONST, .arg = none_idx });
+                    }
+                    try self.instructions.append(self.allocator, .{ .op = .BUILD_SLICE, .arg = 3 });
+                } else {
+                    try self.compileAST(sub.index);
+                }
                 try self.instructions.append(self.allocator, .{ .op = .BINARY_SUBSCR });
             },
             .AssignSubscript => |asub| {
@@ -1066,6 +1083,7 @@ pub const Compiler = struct {
             .Await => |a| {
                 try self.compileAST(a.value);
             },
+            .Slice => {},
         }
     }
 
@@ -1280,6 +1298,7 @@ pub const Compiler = struct {
             .Expr => |e| {
                 try self.resolveScopesAST(e.value);
             },
+            .Slice => {},
         }
     }
 

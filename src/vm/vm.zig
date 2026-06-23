@@ -36,6 +36,8 @@ const exception_mod = @import("../objects/exception.zig");
 const PyExceptionObject = exception_mod.PyExceptionObject;
 const cell_mod = @import("../objects/cell.zig");
 const PyCellObject = cell_mod.PyCellObject;
+const slice_mod = @import("../objects/slice.zig");
+const PySliceObject = slice_mod.PySliceObject;
 
 pub const BlockType = enum {
     Finally,
@@ -1052,6 +1054,21 @@ pub const VM = struct {
                 f.stack_top = stack_top;
                 PyNone.incRef();
                 self.popFrameAndPushResult(PyNone, starting_frame_count);
+                if (self.frame_count == 0) return;
+                frame_idx = self.frame_count - 1;
+                f = &self.frames[frame_idx];
+                ip = f.ip;
+                stack_top = f.stack_top;
+                instructions = f.code.instructions;
+                consts = f.code.consts;
+                names = f.code.names;
+                varnames = f.code.varnames;
+                fastlocals = f.fastlocals;
+                globals = f.globals;
+                locals = &f.locals;
+                is_module = f.is_module;
+                is_class_body = f.is_class_body;
+                func = f.func;
                 continue;
             }
 
@@ -1228,10 +1245,28 @@ pub const VM = struct {
                     try self.stdout_writer.print("{s}\n", .{str_obj.as(PyStringObject).value()});
                 },
                 .RETURN_VALUE => {
+                    if (std.debug.runtime_safety) {
+                        std.debug.print("RET: st={d} ip={d} fi={d}\n", .{stack_top, ip - 1, frame_idx});
+                    }
                     const res = pop(f, &stack_top);
                     f.ip = ip;
                     f.stack_top = stack_top;
                     self.popFrameAndPushResult(res, starting_frame_count);
+                    if (self.frame_count == 0) return;
+                    frame_idx = self.frame_count - 1;
+                    f = &self.frames[frame_idx];
+                    ip = f.ip;
+                    stack_top = f.stack_top;
+                    instructions = f.code.instructions;
+                    consts = f.code.consts;
+                    names = f.code.names;
+                    varnames = f.code.varnames;
+                    fastlocals = f.fastlocals;
+                    globals = f.globals;
+                    locals = &f.locals;
+                    is_module = f.is_module;
+                    is_class_body = f.is_class_body;
+                    func = f.func;
                 },
                 .JUMP_FORWARD => {
                     ip = instr.arg;
@@ -1345,6 +1380,19 @@ pub const VM = struct {
                         }
                     }
                     push(f, &stack_top, &set_obj.base);
+                },
+                .BUILD_SLICE => {
+                    const step = pop(f, &stack_top);
+                    const stop = pop(f, &stack_top);
+                    const start = pop(f, &stack_top);
+                    defer step.decRef(self.mm);
+                    defer stop.decRef(self.mm);
+                    defer start.decRef(self.mm);
+                    const start_val = if (start == PyNone) null else start;
+                    const stop_val = if (stop == PyNone) null else stop;
+                    const step_val = if (step == PyNone) null else step;
+                    const slice_obj = try PySliceObject.create(start_val, stop_val, step_val, self.mm);
+                    push(f, &stack_top, &slice_obj.base);
                 },
                 .MAKE_FUNCTION => {
                     const code_obj = pop(f, &stack_top);
@@ -1706,6 +1754,9 @@ pub const VM = struct {
                     push(f, &stack_top, val);
                 },
                 .POP_TOP => {
+                    if (std.debug.runtime_safety) {
+                        std.debug.print("POP: st={d} ip={d} fi={d}\n", .{stack_top, ip - 1, frame_idx});
+                    }
                     const obj = pop(f, &stack_top);
                     obj.decRef(self.mm);
                 },
@@ -1937,6 +1988,9 @@ pub const VM = struct {
                     }
                 },
                 .FOR_ITER => {
+                    if (std.debug.runtime_safety) {
+                        std.debug.print("FOR: st={d} ip={d} fi={d}\n", .{stack_top, ip - 1, frame_idx});
+                    }
                     // Stack: [..., iterable, index]
                     // If index < len: push iterable[index], index += 1
                     // If index >= len: jump to arg (end of for loop)
@@ -2051,9 +2105,92 @@ pub const VM = struct {
                     const container = pop(f, &stack_top);
                     defer index.decRef(self.mm);
                     defer container.decRef(self.mm);
-                    
+
                     const name = container.type_obj.name;
-                    if (std.mem.eql(u8, name, "list")) {
+
+                    if (std.mem.eql(u8, index.type_obj.name, "slice")) {
+                        const slice = index.as(PySliceObject);
+                        if (std.mem.eql(u8, name, "list")) {
+                            const list = container.as(PyListObject);
+                            const items = if (list.items) |it| it[0..list.size] else &[_]*PyObject{};
+                            const length = @as(i64, @intCast(items.len));
+                            const info = slice.computeIndices(length);
+                            const step = info.step;
+                            if (step == 0) return error.ValueError;
+                            const result = try PyListObject.create(0, self.mm);
+                            if (step > 0) {
+                                var i: i64 = info.start;
+                                while (i < info.stop) : (i += step) {
+                                    const item = items[@intCast(i)];
+                                    try result.append(item, self.mm);
+                                }
+                            } else {
+                                var i: i64 = info.start;
+                                while (i > info.stop) : (i += step) {
+                                    const item = items[@intCast(i)];
+                                    try result.append(item, self.mm);
+                                }
+                            }
+                            push(f, &stack_top, &result.base);
+                        } else if (std.mem.eql(u8, name, "tuple")) {
+                            const tuple = container.as(PyTupleObject);
+                            const items = tuple.items();
+                            const length = @as(i64, @intCast(items.len));
+                            const info = slice.computeIndices(length);
+                            const step = info.step;
+                            if (step == 0) return error.ValueError;
+                            const count = blk: {
+                                var c: i64 = 0;
+                                if (step > 0) { var i = info.start; while (i < info.stop) : (i += step) c += 1; }
+                                else { var i = info.start; while (i > info.stop) : (i += step) c += 1; }
+                                break :blk @as(usize, @intCast(c));
+                            };
+                            const result = try PyTupleObject.create(count, self.mm);
+                            var ri: usize = 0;
+                            if (step > 0) {
+                                var i: i64 = info.start;
+                                while (i < info.stop) : (i += step) {
+                                    const item = items[@intCast(i)];
+                                    item.incRef();
+                                    result.items()[ri] = item;
+                                    ri += 1;
+                                }
+                            } else {
+                                var i: i64 = info.start;
+                                while (i > info.stop) : (i += step) {
+                                    const item = items[@intCast(i)];
+                                    item.incRef();
+                                    result.items()[ri] = item;
+                                    ri += 1;
+                                }
+                            }
+                            push(f, &stack_top, &result.base);
+                        } else if (std.mem.eql(u8, name, "str")) {
+                            const str_val = container.as(PyStringObject).value();
+                            const length = @as(i64, @intCast(str_val.len));
+                            const info = slice.computeIndices(length);
+                            const step = info.step;
+                            if (step == 0) return error.ValueError;
+                            var alloc_writer = std.Io.Writer.Allocating.init(self.mm.allocator);
+                            defer alloc_writer.deinit();
+                            const writer = &alloc_writer.writer;
+                            if (step > 0) {
+                                var i: i64 = info.start;
+                                while (i < info.stop) : (i += step) {
+                                    try writer.writeByte(str_val[@intCast(i)]);
+                                }
+                            } else {
+                                var i: i64 = info.start;
+                                while (i > info.stop) : (i += step) {
+                                    try writer.writeByte(str_val[@intCast(i)]);
+                                }
+                            }
+                            const result = try PyStringObject.create(alloc_writer.written(), self.mm);
+                            push(f, &stack_top, result);
+                        } else {
+                            return error.TypeError;
+                        }
+                    } else if (std.mem.eql(u8, name, "list")) {
                         const list = container.as(PyListObject);
                         const idx = index.as(primitives.PyIntObject).value;
                         const actual_idx = if (idx < 0) @as(i64, @intCast(list.size)) + idx else idx;
@@ -2474,6 +2611,9 @@ pub const VM = struct {
                     func = f.func;
                 },
                 .YIELD_VALUE => {
+                    if (std.debug.runtime_safety) {
+                        std.debug.print("YIELD: st={d} ip={d} fi={d}\n", .{stack_top, ip, frame_idx});
+                    }
                     const val = pop(f, &stack_top);
                     const gen = f.generator.?.as(function_mod.PyGeneratorObject);
 

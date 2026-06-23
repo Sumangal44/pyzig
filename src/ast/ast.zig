@@ -165,6 +165,11 @@ pub const AST = union(enum) {
         value: *AST,
         index: *AST,
     },
+    Slice: struct {
+        start: ?*AST,
+        stop: ?*AST,
+        step: ?*AST,
+    },
     AssignSubscript: struct {
         value: *AST,
         index: *AST,

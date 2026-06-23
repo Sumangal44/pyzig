@@ -27,6 +27,7 @@ pub const Opcode = enum(u8) {
     BUILD_TUPLE,
     BUILD_MAP,
     BUILD_SET,
+    BUILD_SLICE,
     MAKE_FUNCTION,
     CALL,
     

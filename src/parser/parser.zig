@@ -985,12 +985,32 @@ pub const Parser = struct {
                     .attr = try self.builder.allocator.dupe(u8, name),
                 } };
             } else if (self.match(.lbracket)) {
-                const index = try self.parseExpression();
-                try self.consume(.rbracket, "Expect ']' after subscript");
-                expr = AST{ .Subscript = .{
-                    .value = try self.builder.newAST(expr),
-                    .index = try self.builder.newAST(index),
-                } };
+                // Try to parse a slice (detected by ':')
+                const first = if (self.peekType() == .colon) null else try self.parseExpression();
+                if (self.match(.colon)) {
+                    const stop = if (self.peekType() != .colon and self.peekType() != .rbracket) try self.parseExpression() else null;
+                    const step: ?AST = if (self.match(.colon)) blk: {
+                        if (self.peekType() != .rbracket) {
+                            break :blk try self.parseExpression();
+                        }
+                        break :blk null;
+                    } else null;
+                    try self.consume(.rbracket, "Expect ']' after slice");
+                    const start_ptr = if (first) |s| try self.builder.newAST(s) else null;
+                    const stop_ptr = if (stop) |s| try self.builder.newAST(s) else null;
+                    const step_ptr = if (step) |s| try self.builder.newAST(s) else null;
+                    const slice = AST{ .Slice = .{ .start = start_ptr, .stop = stop_ptr, .step = step_ptr } };
+                    expr = AST{ .Subscript = .{
+                        .value = try self.builder.newAST(expr),
+                        .index = try self.builder.newAST(slice),
+                    } };
+                } else {
+                    try self.consume(.rbracket, "Expect ']' after subscript");
+                    expr = AST{ .Subscript = .{
+                        .value = try self.builder.newAST(expr),
+                        .index = try self.builder.newAST(first.?),
+                    } };
+                }
             } else {
                 break;
             }
