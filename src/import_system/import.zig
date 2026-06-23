@@ -4,10 +4,17 @@ const PyTypeObject = @import("../objects/object.zig").PyTypeObject;
 const PyMemoryManager = @import("../memory/allocator.zig").PyMemoryManager;
 const PyDictObject = @import("../objects/collections.zig").PyDictObject;
 const PyStringObject = @import("../objects/primitives.zig").PyStringObject;
+const PyIntObject = @import("../objects/primitives.zig").PyIntObject;
+const PyFloatObject = @import("../objects/primitives.zig").PyFloatObject;
+const PyBuiltinFunctionObject = @import("../objects/function.zig").PyBuiltinFunctionObject;
 const Lexer = @import("../lexer/lexer.zig").Lexer;
 const Parser = @import("../parser/parser.zig").Parser;
 const Compiler = @import("../compiler/compiler.zig").Compiler;
 const VM = @import("../vm/vm.zig").VM;
+const PyInt_Type = @import("../objects/primitives.zig").PyInt_Type;
+const PyFloat_Type = @import("../objects/primitives.zig").PyFloat_Type;
+const PyTrue = @import("../objects/primitives.zig").PyTrue;
+const PyFalse = @import("../objects/primitives.zig").PyFalse;
 
 pub const PyModuleObject = struct {
     base: PyObject,
@@ -132,6 +139,232 @@ pub fn importModule(name: []const u8, vm: *VM) anyerror!*PyObject {
         
         const result = try vm.run(&code, heap_globals);
         result.decRef(vm.mm);
+        compiled_success = true;
+    } else if (std.mem.eql(u8, name, "math")) {
+        // Register math constants
+        const constant_names = &.{ "pi", "e", "tau" };
+        const constant_values = [_]f64{ std.math.pi, std.math.e, std.math.tau };
+        inline for (constant_names, &constant_values) |cname, cval| {
+            const val_obj = try PyFloatObject.create(cval, vm.mm);
+            const name_c = try vm.allocator.dupe(u8, cname);
+            try heap_globals.put(name_c, val_obj);
+        }
+        
+        // Register inf/nan
+        {
+            const inf_obj = try PyFloatObject.create(std.math.inf(f64), vm.mm);
+            const inf_c = try vm.allocator.dupe(u8, "inf");
+            try heap_globals.put(inf_c, inf_obj);
+        }
+        {
+            const nan_obj = try PyFloatObject.create(std.math.nan(f64), vm.mm);
+            const nan_c = try vm.allocator.dupe(u8, "nan");
+            try heap_globals.put(nan_c, nan_obj);
+        }
+        
+        // Register native math functions
+        inline for (&.{ "sqrt", "sin", "cos", "tan", "log", "log10", "log2", "floor", "ceil", "radians", "degrees", "exp" }) |fn_name| {
+            const T = struct {
+                fn mathFn(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+                    const VM2 = @import("../vm/vm.zig").VM;
+                    const vm2: *VM2 = @ptrCast(@alignCast(vm_opaque));
+                    if (args.len != 1) return error.TypeError;
+                    const num = args[0];
+                    const val: f64 = if (num.type_obj == &PyFloat_Type) num.as(PyFloatObject).value
+                        else if (num.type_obj == &PyInt_Type) @floatFromInt(num.as(PyIntObject).value)
+                        else return error.TypeError;
+                    const op = comptime fn_name;
+                    const res = if (comptime std.mem.eql(u8, op, "sqrt")) std.math.sqrt(val)
+                        else if (comptime std.mem.eql(u8, op, "sin")) std.math.sin(val)
+                        else if (comptime std.mem.eql(u8, op, "cos")) std.math.cos(val)
+                        else if (comptime std.mem.eql(u8, op, "tan")) std.math.tan(val)
+                        else if (comptime std.mem.eql(u8, op, "log")) std.math.log(f64, std.math.e, val)
+                        else if (comptime std.mem.eql(u8, op, "log10")) std.math.log10(val)
+                        else if (comptime std.mem.eql(u8, op, "log2")) std.math.log2(val)
+                        else if (comptime std.mem.eql(u8, op, "floor")) @floor(val)
+                        else if (comptime std.mem.eql(u8, op, "ceil")) @ceil(val)
+                        else if (comptime std.mem.eql(u8, op, "radians")) val * std.math.pi / 180.0
+                        else if (comptime std.mem.eql(u8, op, "degrees")) val * 180.0 / std.math.pi
+                        else if (comptime std.mem.eql(u8, op, "exp")) std.math.exp(val)
+                        else val;
+                    return try PyFloatObject.create(res, vm2.mm);
+                }
+            };
+            const builtin_func = try PyBuiltinFunctionObject.create(fn_name, T.mathFn, vm.mm);
+            const name_c = try vm.allocator.dupe(u8, fn_name);
+            try heap_globals.put(name_c, &builtin_func.base);
+        }
+        
+        // Register isfinite, isinf, isnan as native functions
+        {
+            const T = struct {
+                fn isfiniteFn(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+                    _ = vm_opaque;
+                    if (args.len != 1) return error.TypeError;
+                    const num = args[0];
+                    if (num.type_obj == &PyFloat_Type) {
+                        const val = num.as(PyFloatObject).value;
+                        return if (std.math.isFinite(val)) PyTrue else PyFalse;
+                    } else if (num.type_obj == &PyInt_Type) {
+                        return PyTrue;
+                    }
+                    return PyFalse;
+                }
+            };
+            const func = try PyBuiltinFunctionObject.create("isfinite", T.isfiniteFn, vm.mm);
+            const c = try vm.allocator.dupe(u8, "isfinite");
+            try heap_globals.put(c, &func.base);
+        }
+        {
+            const T = struct {
+                fn isinfFn(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+                    _ = vm_opaque;
+                    if (args.len != 1) return error.TypeError;
+                    const num = args[0];
+                    if (num.type_obj == &PyFloat_Type) {
+                        const val = num.as(PyFloatObject).value;
+                        return if (std.math.isInf(val)) PyTrue else PyFalse;
+                    }
+                    return PyFalse;
+                }
+            };
+            const func = try PyBuiltinFunctionObject.create("isinf", T.isinfFn, vm.mm);
+            const c = try vm.allocator.dupe(u8, "isinf");
+            try heap_globals.put(c, &func.base);
+        }
+        {
+            const T = struct {
+                fn isnanFn(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+                    _ = vm_opaque;
+                    if (args.len != 1) return error.TypeError;
+                    const num = args[0];
+                    if (num.type_obj == &PyFloat_Type) {
+                        const val = num.as(PyFloatObject).value;
+                        return if (std.math.isNan(val)) PyTrue else PyFalse;
+                    }
+                    return PyFalse;
+                }
+            };
+            const func = try PyBuiltinFunctionObject.create("isnan", T.isnanFn, vm.mm);
+            const c = try vm.allocator.dupe(u8, "isnan");
+            try heap_globals.put(c, &func.base);
+        }
+        
+        compiled_success = true;
+    } else if (std.mem.eql(u8, name, "random")) {
+        // Register random.random()
+        {
+            const T = struct {
+                fn randomFn(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+                    const VM2 = @import("../vm/vm.zig").VM;
+                    const vm2: *VM2 = @ptrCast(@alignCast(vm_opaque));
+                    if (args.len != 0) return error.TypeError;
+                    var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(@intFromPtr(args.ptr))));
+                    const val = prng.random().float(f64);
+                    return try PyFloatObject.create(val, vm2.mm);
+                }
+            };
+            const func = try PyBuiltinFunctionObject.create("random", T.randomFn, vm.mm);
+            const c = try vm.allocator.dupe(u8, "random");
+            try heap_globals.put(c, &func.base);
+        }
+        
+        // Register random.randint(a, b)
+        {
+            const T = struct {
+                fn randintFn(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+                    const VM2 = @import("../vm/vm.zig").VM;
+                    const vm2: *VM2 = @ptrCast(@alignCast(vm_opaque));
+                    if (args.len != 2) return error.TypeError;
+                    if (args[0].type_obj != &PyInt_Type or args[1].type_obj != &PyInt_Type) return error.TypeError;
+                    const a = args[0].as(PyIntObject).value;
+                    const b = args[1].as(PyIntObject).value;
+                    if (a > b) return error.TypeError;
+                    var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(@intFromPtr(args.ptr))));
+                    const range = b - a + 1;
+                    const val = a + @as(i64, @intCast(prng.random().uintLessThan(u64, @as(u64, @intCast(range)))));
+                    return try PyIntObject.create(val, vm2.mm);
+                }
+            };
+            const func = try PyBuiltinFunctionObject.create("randint", T.randintFn, vm.mm);
+            const c = try vm.allocator.dupe(u8, "randint");
+            try heap_globals.put(c, &func.base);
+        }
+        
+        // Register random.choice(seq)
+        {
+            const T = struct {
+                fn choiceFn(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+                    const VM2 = @import("../vm/vm.zig").VM;
+                    const vm2: *VM2 = @ptrCast(@alignCast(vm_opaque));
+                    if (args.len != 1) return error.TypeError;
+                    const seq = args[0];
+                    const type_name = seq.type_obj.name;
+                    var len: usize = 0;
+                    if (std.mem.eql(u8, type_name, "list")) {
+                        len = seq.as(@import("../objects/collections.zig").PyListObject).size;
+                    } else if (std.mem.eql(u8, type_name, "tuple")) {
+                        len = seq.as(@import("../objects/collections.zig").PyTupleObject).size;
+                    } else if (std.mem.eql(u8, type_name, "str")) {
+                        len = seq.as(@import("../objects/primitives.zig").PyStringObject).len;
+                    } else {
+                        return error.TypeError;
+                    }
+                    if (len == 0) return error.TypeError;
+                    var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(@intFromPtr(args.ptr))));
+                    const idx = prng.random().uintLessThan(u64, @as(u64, @intCast(len)));
+                    const collections = @import("../objects/collections.zig");
+                    const primitives = @import("../objects/primitives.zig");
+                    if (std.mem.eql(u8, type_name, "list")) {
+                        const item = seq.as(collections.PyListObject).items.?[idx];
+                        item.incRef();
+                        return item;
+                    } else if (std.mem.eql(u8, type_name, "tuple")) {
+                        const item = seq.as(collections.PyTupleObject).items()[idx];
+                        item.incRef();
+                        return item;
+                    } else {
+                        const str_val = seq.as(primitives.PyStringObject).value();
+                        const ch = try primitives.PyStringObject.create(str_val[idx..idx+1], vm2.mm);
+                        return ch;
+                    }
+                }
+            };
+            const func = try PyBuiltinFunctionObject.create("choice", T.choiceFn, vm.mm);
+            const c = try vm.allocator.dupe(u8, "choice");
+            try heap_globals.put(c, &func.base);
+        }
+        
+        // Register random.shuffle(x)
+        {
+            const T = struct {
+                fn shuffleFn(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+                    _ = vm_opaque;
+                    if (args.len != 1) return error.TypeError;
+                    const seq = args[0];
+                    if (seq.type_obj != &(@import("../objects/collections.zig").PyList_Type)) return error.TypeError;
+                    const list = seq.as(@import("../objects/collections.zig").PyListObject);
+                    const PyNone = @import("../objects/primitives.zig").PyNone;
+                    if (list.size <= 1) { PyNone.incRef(); return PyNone; }
+                    var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(@intFromPtr(args.ptr))));
+                    const rng = prng.random();
+                    var i: usize = list.size;
+                    while (i > 1) {
+                        i -= 1;
+                        const j = rng.uintLessThan(u64, @as(u64, @intCast(i + 1)));
+                        const tmp = list.items.?[i];
+                        list.items.?[i] = list.items.?[j];
+                        list.items.?[j] = tmp;
+                    }
+                    PyNone.incRef();
+                    return PyNone;
+                }
+            };
+            const func = try PyBuiltinFunctionObject.create("shuffle", T.shuffleFn, vm.mm);
+            const c = try vm.allocator.dupe(u8, "shuffle");
+            try heap_globals.put(c, &func.base);
+        }
+        
         compiled_success = true;
     } else {
         var file_name_buf: [128]u8 = undefined;
