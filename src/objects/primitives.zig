@@ -217,6 +217,14 @@ fn int_mul(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerror!*Py
         const a = @as(f64, @floatFromInt(self.as(PyIntObject).value));
         const b = other.as(PyComplexObject);
         return try PyComplexObject.create(a * b.real, a * b.imag, mm);
+    } else if (std.mem.eql(u8, other_name, "str")) {
+        if (other.type_obj.tp_mul) |mul_fn| {
+            return try mul_fn(other, self, mm);
+        }
+    } else if (std.mem.eql(u8, other_name, "list") or std.mem.eql(u8, other_name, "tuple")) {
+        if (other.type_obj.tp_mul) |mul_fn| {
+            return try mul_fn(other, self, mm);
+        }
     }
     return error.TypeError;
 }
@@ -438,6 +446,7 @@ pub const PyStringObject = extern struct {
     base: PyObject,
     ptr: [*]const u8,
     len: usize,
+    hash: i64 = -1,
 
     pub fn value(self: *const PyStringObject) []const u8 {
         return self.ptr[0..self.len];
@@ -451,6 +460,7 @@ pub const PyStringObject = extern struct {
             .base = PyObject.init(&PyString_Type),
             .ptr = copy.ptr,
             .len = copy.len,
+            .hash = -1,
         };
         return &obj.base;
     }
@@ -462,19 +472,26 @@ pub const PyString_Type = PyTypeObject{
     .tp_repr = string_repr,
     .tp_str = string_str,
     .tp_add = string_add,
+    .tp_mul = string_mul,
     .tp_richcompare = string_richcompare,
     .tp_bool = string_bool,
     .tp_hash = string_hash,
 };
 
 fn string_hash(self: *PyObject) anyerror!i64 {
-    const val = self.as(PyStringObject).value();
+    const obj = self.as(PyStringObject);
+    if (obj.hash != -1) {
+        return obj.hash;
+    }
+    const val = obj.value();
     var hash: usize = 14695981039346656037;
     for (val) |c| {
         hash ^= c;
         hash = hash *% 1099511628211;
     }
-    return @bitCast(hash);
+    const h: i64 = @bitCast(hash);
+    obj.hash = if (h == -1) @as(i64, -2) else h;
+    return obj.hash;
 }
 
 fn string_dealloc(self: *PyObject, mm: *PyMemoryManager) void {
@@ -526,6 +543,38 @@ fn string_add(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerror!
         .base = PyObject.init(&PyString_Type),
         .ptr = merged.ptr,
         .len = merged.len,
+    };
+    return &obj.base;
+}
+
+fn string_mul(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
+    if (other.type_obj != &PyInt_Type) {
+        return error.TypeError;
+    }
+    const val = self.as(PyStringObject).value();
+    const count = other.as(PyIntObject).value;
+    if (count <= 0) {
+        const empty = try mm.allocBytes(0);
+        const obj = try mm.alloc(PyStringObject);
+        obj.* = .{
+            .base = PyObject.init(&PyString_Type),
+            .ptr = empty.ptr,
+            .len = 0,
+        };
+        return &obj.base;
+    }
+    const ucount = @as(usize, @intCast(count));
+    const total_len = val.len * ucount;
+    const repeated = try mm.allocBytes(total_len);
+    var i: usize = 0;
+    while (i < ucount) : (i += 1) {
+        @memcpy(repeated[i * val.len .. (i + 1) * val.len], val);
+    }
+    const obj = try mm.alloc(PyStringObject);
+    obj.* = .{
+        .base = PyObject.init(&PyString_Type),
+        .ptr = repeated.ptr,
+        .len = repeated.len,
     };
     return &obj.base;
 }

@@ -109,11 +109,22 @@ pub const AST = union(enum) {
     While: struct {
         cond: *AST,
         body: []AST,
+        else_body: []AST = &[_]AST{},
     },
     For: struct {
         target: []const u8,
         iter: *AST,
         body: []AST,
+        else_body: []AST = &[_]AST{},
+    },
+    // Starred expression for unpacking: *x in assignment targets
+    Starred: struct {
+        value: *AST,
+    },
+    // Tuple unpacking assignment: a, b = expr
+    UnpackAssign: struct {
+        targets: []AST, // list of Name/Starred nodes
+        value: *AST,
     },
     Break: void,
     Continue: void,
@@ -137,11 +148,17 @@ pub const AST = union(enum) {
         name: []const u8,
         args: [][]const u8,
         defaults: []AST,
+        vararg: ?[]const u8 = null,   // *args name, or null
+        kwarg: ?[]const u8 = null,    // **kwargs name, or null
+        kwonlyargs: [][]const u8 = &[_][]const u8{}, // keyword-only args after *
+        kwonly_defaults: []AST = &[_]AST{}, // defaults for kwonly args
         body: []AST,
         decorators: []AST,
     },
     Lambda: struct {
         args: [][]const u8,
+        defaults: []AST = &[_]AST{},
+        vararg: ?[]const u8 = null,
         body: *AST,
     },
     Return: struct {
@@ -150,6 +167,8 @@ pub const AST = union(enum) {
     Call: struct {
         func: *AST,
         args: []AST,
+        starargs: ?*AST = null,  // *expr positional spread
+        kwargs: ?*AST = null,    // **expr keyword spread
     },
     Pass: void,
     ClassDef: struct {
@@ -181,6 +200,20 @@ pub const AST = union(enum) {
         index: *AST,
         expr: *AST,
     },
+    // Augmented assignment on attribute: obj.attr op= expr
+    AugAssignAttr: struct {
+        value: *AST,
+        attr: []const u8,
+        op: Op,
+        expr: *AST,
+    },
+    // Augmented assignment on subscript: obj[key] op= expr
+    AugAssignSubscript: struct {
+        value: *AST,
+        index: *AST,
+        op: Op,
+        expr: *AST,
+    },
     Try: struct {
         body: []AST,
         handlers: []ExceptHandler,
@@ -188,6 +221,7 @@ pub const AST = union(enum) {
     },
     Raise: struct {
         exc: ?*AST,
+        cause: ?*AST,
     },
     Nonlocal: struct {
         names: [][]const u8,
@@ -234,6 +268,15 @@ pub const AST = union(enum) {
     UnaryOp: struct {
         op: enum { Not, Neg, Invert },
         operand: *AST,
+    },
+    // F-string: a sequence of literal parts (String) and expression parts (any AST)
+    FString: struct {
+        parts: []AST, // alternating literal strings and expressions
+    },
+    // Keyword argument: name=value (used in Call)
+    Keyword: struct {
+        name: []const u8,
+        value: *AST,
     },
 };
 

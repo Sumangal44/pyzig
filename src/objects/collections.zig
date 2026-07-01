@@ -9,9 +9,9 @@ const PyTrue = primitives.PyTrue;
 const PyFalse = primitives.PyFalse;
 const PyStringObject = primitives.PyStringObject;
 const PyIntObject = primitives.PyIntObject;
-const PyInt_Type = primitives.PyInt_Type;
-const PyFloat_Type = primitives.PyFloat_Type;
-const PyString_Type = primitives.PyString_Type;
+const PyInt_Type = &primitives.PyInt_Type;
+const PyFloat_Type = &primitives.PyFloat_Type;
+const PyString_Type = &primitives.PyString_Type;
 const CompareOp = @import("object.zig").CompareOp;
 
 // --- Helper for Repr ---
@@ -55,7 +55,40 @@ pub const PyTuple_Type = PyTypeObject{
     .tp_repr = tuple_repr,
     .tp_str = tuple_repr,
     .tp_richcompare = tuple_richcompare,
+    .tp_mul = tuple_mul,
 };
+
+fn tuple_mul(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
+    if (other.type_obj != PyInt_Type) {
+        return error.TypeError;
+    }
+    const tuple = self.as(PyTupleObject);
+    const count = other.as(PyIntObject).value;
+    if (count <= 0) {
+        return & (try PyTupleObject.create(0, mm)).base;
+    }
+    const ucount = @as(usize, @intCast(count));
+    const total_size = tuple.size * ucount;
+    const new_tuple = try PyTupleObject.create(total_size, mm);
+    errdefer new_tuple.base.decRef(mm);
+    
+    const slice = new_tuple.items();
+    const old_slice = tuple.items();
+    
+    var i: usize = 0;
+    while (i < ucount) : (i += 1) {
+        if (tuple.size > 0) {
+            for (0..tuple.size) |j| {
+                const item = old_slice[j];
+                const target_idx = i * tuple.size + j;
+                slice[target_idx].decRef(mm);
+                item.incRef();
+                slice[target_idx] = item;
+            }
+        }
+    }
+    return &new_tuple.base;
+}
 
 fn tuple_dealloc(self: *PyObject, mm: *PyMemoryManager) void {
     const obj = self.as(PyTupleObject);
@@ -274,7 +307,34 @@ pub const PyList_Type = PyTypeObject{
     .tp_repr = list_repr,
     .tp_str = list_repr,
     .tp_richcompare = list_richcompare,
+    .tp_mul = list_mul,
 };
+
+fn list_mul(self: *PyObject, other: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
+    if (other.type_obj != PyInt_Type) {
+        return error.TypeError;
+    }
+    const list = self.as(PyListObject);
+    const count = other.as(PyIntObject).value;
+    if (count <= 0) {
+        return & (try PyListObject.create(0, mm)).base;
+    }
+    const ucount = @as(usize, @intCast(count));
+    const total_size = list.size * ucount;
+    const new_list = try PyListObject.create(total_size, mm);
+    errdefer new_list.base.decRef(mm);
+    
+    var i: usize = 0;
+    while (i < ucount) : (i += 1) {
+        if (list.size > 0) {
+            for (0..list.size) |j| {
+                const item = list.items.?[j];
+                try new_list.append(item, mm);
+            }
+        }
+    }
+    return &new_list.base;
+}
 
 fn list_dealloc(self: *PyObject, mm: *PyMemoryManager) void {
     const obj = self.as(PyListObject);
@@ -557,10 +617,9 @@ pub const PyDictObject = extern struct {
         if (self.indices_size > 0) {
             // Iterate over indices table to skip tombstoned (-2) and empty (-1) entries.
             // This prevents use-after-free from deleted entries whose keys/values have been decRef'd.
-            for (0..self.indices_size) |bucket_i| {
-                const entry_idx = self.indices[bucket_i];
-                if (entry_idx < 0) continue; // skip empty or tombstoned
-                const entry = &self.entries[@intCast(entry_idx)];
+            for (0..self.entries_size) |entry_i| {
+                const entry = &self.entries[entry_i];
+                if (entry.key == null) continue; // skip empty or tombstoned
                 new_entries[new_entries_size] = entry.*;
                 
                 const mask = new_indices_size - 1;
@@ -587,30 +646,29 @@ pub const PyDictObject = extern struct {
 
     pub fn keys(self: *PyDictObject, mm: *PyMemoryManager) !*PyListObject {
         const result = try PyListObject.create(self.active_count, mm);
-        for (0..self.indices_size) |i| {
-            const entry_idx = self.indices[i];
-            if (entry_idx < 0) continue;
-            try result.append(self.entries[@intCast(entry_idx)].key.?, mm);
+        for (0..self.entries_size) |i| {
+            const entry = &self.entries[i];
+            if (entry.key == null) continue;
+            try result.append(entry.key.?, mm);
         }
         return result;
     }
 
     pub fn values(self: *PyDictObject, mm: *PyMemoryManager) !*PyListObject {
         const result = try PyListObject.create(self.active_count, mm);
-        for (0..self.indices_size) |i| {
-            const entry_idx = self.indices[i];
-            if (entry_idx < 0) continue;
-            try result.append(self.entries[@intCast(entry_idx)].value.?, mm);
+        for (0..self.entries_size) |i| {
+            const entry = &self.entries[i];
+            if (entry.key == null) continue;
+            try result.append(entry.value.?, mm);
         }
         return result;
     }
 
     pub fn items(self: *PyDictObject, mm: *PyMemoryManager) !*PyListObject {
         const result = try PyListObject.create(self.active_count, mm);
-        for (0..self.indices_size) |i| {
-            const entry_idx = self.indices[i];
-            if (entry_idx < 0) continue;
-            const entry = &self.entries[@intCast(entry_idx)];
+        for (0..self.entries_size) |i| {
+            const entry = &self.entries[i];
+            if (entry.key == null) continue;
             const tup = try PyTupleObject.create(2, mm);
             tup.items()[0] = entry.key.?;
             entry.key.?.incRef();
@@ -649,10 +707,9 @@ pub const PyDictObject = extern struct {
     }
 
     pub fn update(self: *PyDictObject, other: *PyDictObject, mm: *PyMemoryManager) !void {
-        for (0..other.indices_size) |i| {
-            const entry_idx = other.indices[i];
-            if (entry_idx < 0) continue;
-            const entry = &other.entries[@intCast(entry_idx)];
+        for (0..other.entries_size) |i| {
+            const entry = &other.entries[i];
+            if (entry.key == null) continue;
             try self.setItem(entry.key.?, entry.value.?, mm);
         }
     }
@@ -676,10 +733,9 @@ pub const PyDictObject = extern struct {
 
     pub fn copy(self: *PyDictObject, mm: *PyMemoryManager) !*PyDictObject {
         const result = try PyDictObject.create(mm);
-        for (0..self.indices_size) |i| {
-            const entry_idx = self.indices[i];
-            if (entry_idx < 0) continue;
-            const entry = &self.entries[@intCast(entry_idx)];
+        for (0..self.entries_size) |i| {
+            const entry = &self.entries[i];
+            if (entry.key == null) continue;
             try result.setItem(entry.key.?, entry.value.?, mm);
         }
         return result;
@@ -718,11 +774,10 @@ fn dict_repr(self: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
     
     try writer.writeAll("{");
     var first = true;
-    // Iterate over indices table to skip tombstoned entries
-    for (0..obj.indices_size) |i| {
-        const entry_idx = obj.indices[i];
-        if (entry_idx < 0) continue; // skip empty or tombstoned
-        const entry = &obj.entries[@intCast(entry_idx)];
+    // Iterate over entries table to skip tombstoned entries
+    for (0..obj.entries_size) |i| {
+        const entry = &obj.entries[i];
+        if (entry.key == null) continue; // skip empty or tombstoned
         
         if (!first) try writer.writeAll(", ");
         first = false;

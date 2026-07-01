@@ -101,3 +101,66 @@ pub const PyRuntimeError_Type = PyTypeObject{
     .tp_repr = exception_repr,
     .tp_str = exception_repr,
 };
+
+pub const PyZeroDivisionError_Type = PyTypeObject{
+    .name = "ZeroDivisionError",
+    .tp_dealloc = exception_dealloc,
+    .tp_repr = exception_repr,
+    .tp_str = exception_repr,
+};
+
+pub const PyImportError_Type = PyTypeObject{
+    .name = "ImportError",
+    .tp_dealloc = exception_dealloc,
+    .tp_repr = exception_repr,
+    .tp_str = exception_repr,
+};
+
+pub const PyModuleNotFoundError_Type = PyTypeObject{
+    .name = "ModuleNotFoundError",
+    .tp_dealloc = exception_dealloc,
+    .tp_repr = exception_repr,
+    .tp_str = exception_repr,
+};
+
+pub const PyFileNotFoundError_Type = PyTypeObject{
+    .name = "FileNotFoundError",
+    .tp_dealloc = exception_dealloc,
+    .tp_repr = exception_repr,
+    .tp_str = exception_repr,
+};
+
+pub const PyPermissionError_Type = PyTypeObject{
+    .name = "PermissionError",
+    .tp_dealloc = exception_dealloc,
+    .tp_repr = exception_repr,
+    .tp_str = exception_repr,
+};
+
+pub const PyMemoryError_Type = PyTypeObject{
+    .name = "MemoryError",
+    .tp_dealloc = exception_dealloc,
+    .tp_repr = exception_repr,
+    .tp_str = exception_repr,
+};
+
+pub const PyRecursionError_Type = PyTypeObject{
+    .name = "RecursionError",
+    .tp_dealloc = exception_dealloc,
+    .tp_repr = exception_repr,
+    .tp_str = exception_repr,
+};
+
+pub const PyIndentationError_Type = PyTypeObject{
+    .name = "IndentationError",
+    .tp_dealloc = exception_dealloc,
+    .tp_repr = exception_repr,
+    .tp_str = exception_repr,
+};
+
+pub const PyUnboundLocalError_Type = PyTypeObject{
+    .name = "UnboundLocalError",
+    .tp_dealloc = exception_dealloc,
+    .tp_repr = exception_repr,
+    .tp_str = exception_repr,
+};

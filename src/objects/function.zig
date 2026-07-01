@@ -9,14 +9,21 @@ pub const PyFunctionObject = struct {
     code: *PyObject, // points to PyCodeObjectWrapper
     globals: *std.StringHashMap(*PyObject),
     closure: std.StringHashMap(*PyObject), // map from name (string) to PyCellObject
+    defaults: []*PyObject, // default values for arguments
     
-    pub fn create(code: *PyObject, globals: *std.StringHashMap(*PyObject), mm: *PyMemoryManager) !*PyFunctionObject {
+    pub fn create(code: *PyObject, globals: *std.StringHashMap(*PyObject), defaults: []*PyObject, mm: *PyMemoryManager) !*PyFunctionObject {
         const obj = try mm.alloc(PyFunctionObject);
+        const defaults_copy = try mm.allocator.alloc(*PyObject, defaults.len);
+        for (defaults, 0..) |d, i| {
+            defaults_copy[i] = d;
+            d.incRef();
+        }
         obj.* = .{
             .base = PyObject.init(&PyFunction_Type),
             .code = code,
             .globals = globals,
             .closure = std.StringHashMap(*PyObject).init(mm.allocator),
+            .defaults = defaults_copy,
         };
         code.incRef();
         return obj;
@@ -39,6 +46,10 @@ fn function_dealloc(self: *PyObject, mm: *PyMemoryManager) void {
         entry.value_ptr.*.decRef(mm);
     }
     obj.closure.deinit();
+    for (obj.defaults) |d| {
+        d.decRef(mm);
+    }
+    mm.allocator.free(obj.defaults);
     mm.free(PyFunctionObject, obj);
 }
 

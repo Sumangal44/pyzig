@@ -125,3 +125,43 @@ fn method_repr(self: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
     const name = std.fmt.bufPrint(&buf, "<bound method of <{s} object>>", .{obj.self_obj.type_obj.name}) catch "<bound method>";
     return try PyStringObject.create(name, mm);
 }
+
+pub const PySuperObject = extern struct {
+    base: PyObject,
+    self_obj: *PyObject,
+    lookup_class: ?*PyClassObject,
+
+    pub fn create(self_obj: *PyObject, lookup_class: ?*PyClassObject, mm: *PyMemoryManager) !*PySuperObject {
+        const obj = try mm.alloc(PySuperObject);
+        obj.* = .{
+            .base = PyObject.init(&PySuper_Type),
+            .self_obj = self_obj,
+            .lookup_class = lookup_class,
+        };
+        self_obj.incRef();
+        if (lookup_class) |lc| lc.base.incRef();
+        return obj;
+    }
+};
+
+pub const PySuper_Type = PyTypeObject{
+    .name = "super",
+    .tp_dealloc = super_dealloc,
+    .tp_repr = super_repr,
+    .tp_str = super_repr,
+};
+
+fn super_dealloc(self: *PyObject, mm: *PyMemoryManager) void {
+    const obj = self.as(PySuperObject);
+    obj.self_obj.decRef(mm);
+    if (obj.lookup_class) |lc| lc.base.decRef(mm);
+    mm.free(PySuperObject, obj);
+}
+
+fn super_repr(self: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
+    const obj = self.as(PySuperObject);
+    var buf: [256]u8 = undefined;
+    const name = std.fmt.bufPrint(&buf, "<super object at 0x{x}>", .{@intFromPtr(obj)}) catch "<super object>";
+    return try PyStringObject.create(name, mm);
+}
+

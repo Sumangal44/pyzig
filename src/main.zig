@@ -63,6 +63,7 @@ pub fn main(init: std.process.Init) !void {
     var run_repl = true;
     var run_code_str: ?[]const u8 = null;
     var run_file_path: ?[]const u8 = null;
+    var diagnostic_mode: VM.DiagnosticMode = .none;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "-c")) {
@@ -74,6 +75,10 @@ pub fn main(init: std.process.Init) !void {
                 try stdout_writer.flush();
                 std.process.exit(1);
             }
+        } else if (std.mem.eql(u8, arg, "--hinglish")) {
+            diagnostic_mode = .hinglish;
+        } else if (std.mem.eql(u8, arg, "--jugaad")) {
+            diagnostic_mode = .jugaad;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             try stdout_writer.print("Unknown option: {s}\n", .{arg});
             try stdout_writer.flush();
@@ -86,7 +91,52 @@ pub fn main(init: std.process.Init) !void {
 
     // Initialize the VM with the stdout writer, memory manager, and IO context
     var vm = try VM.init(allocator, &mm, stdout_writer, io);
+    vm.diagnostic_mode = diagnostic_mode;
     defer vm.deinit();
+
+    // Populate sys.argv list
+    {
+        const collections = @import("objects/collections.zig");
+        const sys_argv = try collections.PyListObject.create(0, &mm);
+        errdefer sys_argv.base.decRef(&mm);
+
+        var args_it = init.minimal.args.iterate();
+        _ = args_it.next(); // Skip executable
+
+        var has_added_first = false;
+        while (args_it.next()) |arg| {
+            if (!has_added_first) {
+                if (std.mem.eql(u8, arg, "-c")) {
+                    const py_arg = try primitives.PyStringObject.create("-c", &mm);
+                    defer py_arg.decRef(&mm);
+                    try sys_argv.append(py_arg, &mm);
+                    has_added_first = true;
+                    _ = args_it.next(); // Skip code string
+                } else if (std.mem.startsWith(u8, arg, "-")) {
+                    // Skip interpreter flags
+                } else {
+                    const py_arg = try primitives.PyStringObject.create(arg, &mm);
+                    defer py_arg.decRef(&mm);
+                    try sys_argv.append(py_arg, &mm);
+                    has_added_first = true;
+                }
+            } else {
+                const py_arg = try primitives.PyStringObject.create(arg, &mm);
+                defer py_arg.decRef(&mm);
+                try sys_argv.append(py_arg, &mm);
+            }
+        }
+        if (!has_added_first) {
+            const py_arg = try primitives.PyStringObject.create("", &mm);
+            defer py_arg.decRef(&mm);
+            try sys_argv.append(py_arg, &mm);
+        }
+
+        // Initialize import system and set sys.argv
+        const import_system = @import("import_system/import.zig");
+        try import_system.initImportSystem(allocator, &mm);
+        import_system.setSysArgv(&sys_argv.base);
+    }
 
     if (run_code_str) |code| {
         executeString(allocator, &mm, code, stdout_writer, &vm) catch |err| {
@@ -171,3 +221,8 @@ test {
     _ = @import("compiler/compiler.zig");
     _ = @import("vm/vm.zig");
 }
+
+
+
+
+

@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
+const PyObject = @import("../objects/object.zig").PyObject;
 
 pub const PyMemoryManager = struct {
     allocator: std.mem.Allocator,
@@ -10,10 +11,12 @@ pub const PyMemoryManager = struct {
     int_free_list: ?*anyopaque = null,
     float_free_list: ?*anyopaque = null,
     complex_free_list: ?*anyopaque = null,
+    interned_strings: std.StringHashMap(*PyObject),
 
     pub fn init(allocator: std.mem.Allocator) PyMemoryManager {
         return .{
             .allocator = allocator,
+            .interned_strings = std.StringHashMap(*PyObject).init(allocator),
         };
     }
 
@@ -49,6 +52,41 @@ pub const PyMemoryManager = struct {
             complex_node = next;
         }
         self.complex_free_list = null;
+        var it = self.interned_strings.iterator();
+        while (it.next()) |entry| {
+            const obj = entry.value_ptr.*.as(primitives.PyStringObject);
+            const obj_len = obj.len;
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(@constCast(obj.ptr[0..obj_len]));
+            self.allocator.destroy(obj);
+            self.allocated_bytes -= @sizeOf(primitives.PyStringObject) + obj_len;
+            self.object_count -= 2;
+        }
+        self.interned_strings.deinit();
+    }
+
+    pub fn internString(self: *PyMemoryManager, val: []const u8) !*PyObject {
+        const primitives = @import("../objects/primitives.zig");
+        if (self.interned_strings.get(val)) |existing| {
+            return existing;
+        }
+        const copy = try self.allocator.alloc(u8, val.len);
+        @memcpy(copy, val);
+        const obj = try self.allocator.create(primitives.PyStringObject);
+        obj.* = .{
+            .base = .{
+                .refcnt = 999999,
+                .type_obj = &primitives.PyString_Type,
+            },
+            .ptr = copy.ptr,
+            .len = copy.len,
+            .hash = -1,
+        };
+        self.allocated_bytes += @sizeOf(primitives.PyStringObject) + val.len;
+        self.object_count += 2;
+        const key_copy = try self.allocator.dupe(u8, val);
+        try self.interned_strings.put(key_copy, &obj.base);
+        return &obj.base;
     }
 
     pub fn alloc(self: *PyMemoryManager, comptime T: type) !*T {

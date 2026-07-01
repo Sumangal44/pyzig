@@ -194,24 +194,80 @@ pub const Parser = struct {
         const cond = try self.parseExpression();
         try self.consume(.colon, "Expect ':' after while condition");
         const body = try self.parseBlock();
+        var else_body: []AST = &[_]AST{};
+        if (self.match(.kw_else)) {
+            try self.consume(.colon, "Expect ':' after while-else");
+            else_body = try self.parseBlock();
+        }
         return AST{ .While = .{
             .cond = try self.builder.newAST(cond),
             .body = body,
+            .else_body = else_body,
         } };
     }
 
     fn parseForStatement(self: *Parser) anyerror!AST {
         try self.consume(.kw_for, "Expect 'for'");
-        const target = self.current_token.lexeme;
+        // Check for tuple unpacking target: a, b in ...
+        var targets = std.ArrayList(AST).empty;
+        errdefer targets.deinit(self.builder.allocator);
+        const first_target = self.current_token.lexeme;
         try self.consume(.identifier, "Expect loop variable name");
+        try targets.append(self.builder.allocator, AST{ .Name = first_target });
+        var is_tuple_target = false;
+        while (self.peekType() == .comma) {
+            self.advance(); // consume comma
+            if (self.peekType() == .kw_in) break; // trailing comma
+            const t = self.current_token.lexeme;
+            try self.consume(.identifier, "Expect variable name in for target");
+            try targets.append(self.builder.allocator, AST{ .Name = t });
+            is_tuple_target = true;
+        }
         try self.consume(.kw_in, "Expect 'in' after for variable");
         const iter = try self.parseExpression();
         try self.consume(.colon, "Expect ':' after for iterable");
         const body = try self.parseBlock();
+        var else_body: []AST = &[_]AST{};
+        if (self.match(.kw_else)) {
+            try self.consume(.colon, "Expect ':' after for-else");
+            else_body = try self.parseBlock();
+        }
+        if (is_tuple_target or targets.items.len > 1) {
+            // Build UnpackAssign-style for loop: we need a special target
+            // Encode as a For with target = "__for_unpack__" and unpack in body prepended
+            // Actually use the first target as a temp and emit unpack:
+            // We'll represent it as a For with target = targets[0].Name and body with unpack
+            // For simplicity, encode as a regular for with a synthetic unpack at body start.
+            // Use a special target name that signals unpacking.
+            const all_targets = try targets.toOwnedSlice(self.builder.allocator);
+            // Build the synthetic unpack assignment inside the body
+            const tgt_tuple = AST{ .Tuple = .{ .elts = all_targets } };
+            const iter_ptr = try self.builder.newAST(iter);
+            _ = tgt_tuple; _ = iter_ptr; // used below
+            // For now: use first target as loop var, prepend unpack to body
+            const main_target = all_targets[0].Name;
+            var new_body = try self.builder.allocator.alloc(AST, body.len + 1);
+            // Insert unpack of loop var at start of body
+            var unpack_targets = try self.builder.allocator.alloc(AST, all_targets.len);
+            for (all_targets, 0..) |t, i| { unpack_targets[i] = t; }
+            const loop_var_ast = try self.builder.newAST(AST{ .Name = main_target });
+            new_body[0] = AST{ .UnpackAssign = .{
+                .targets = unpack_targets,
+                .value = loop_var_ast,
+            }};
+            for (body, 0..) |s, i| { new_body[i + 1] = s; }
+            return AST{ .For = .{
+                .target = try self.builder.allocator.dupe(u8, main_target),
+                .iter = try self.builder.newAST(iter),
+                .body = new_body,
+                .else_body = else_body,
+            }};
+        }
         return AST{ .For = .{
-            .target = try self.builder.allocator.dupe(u8, target),
+            .target = try self.builder.allocator.dupe(u8, targets.items[0].Name),
             .iter = try self.builder.newAST(iter),
             .body = body,
+            .else_body = else_body,
         } };
     }
 
@@ -223,21 +279,67 @@ pub const Parser = struct {
         
         var args = std.ArrayList([]const u8).empty;
         var defaults = std.ArrayList(AST).empty;
+        var kwonlyargs = std.ArrayList([]const u8).empty;
+        var kwonly_defaults = std.ArrayList(AST).empty;
+        var vararg: ?[]const u8 = null;
+        var kwarg: ?[]const u8 = null;
         errdefer {
             for (args.items) |a| self.builder.allocator.free(a);
             args.deinit(self.builder.allocator);
             defaults.deinit(self.builder.allocator);
+            if (vararg) |va| self.builder.allocator.free(va);
+            if (kwarg) |ka| self.builder.allocator.free(ka);
+            for (kwonlyargs.items) |a| self.builder.allocator.free(a);
+            kwonlyargs.deinit(self.builder.allocator);
+            kwonly_defaults.deinit(self.builder.allocator);
         }
         
+        var seen_vararg = false;
         while (self.peekType() != .rparen) {
+            if (self.peekType() == .double_star) {
+                // **kwargs
+                self.advance();
+                kwarg = try self.builder.allocator.dupe(u8, self.current_token.lexeme);
+                try self.consume(.identifier, "Expect name after **");
+                if (self.peekType() == .comma) self.advance();
+                break;
+            } else if (self.peekType() == .star) {
+                self.advance();
+                if (self.peekType() == .identifier) {
+                    // *args
+                    vararg = try self.builder.allocator.dupe(u8, self.current_token.lexeme);
+                    try self.consume(.identifier, "Expect name after *");
+                    seen_vararg = true;
+                    if (self.peekType() == .comma) self.advance();
+                } else if (self.peekType() == .comma or self.peekType() == .rparen) {
+                    // bare * — keyword-only separator
+                    seen_vararg = true;
+                    if (self.peekType() == .comma) self.advance();
+                } else {
+                    return error.ParseError;
+                }
+                continue;
+            }
+            
             const arg_name = self.current_token.lexeme;
             try self.consume(.identifier, "Expect parameter name");
-            try args.append(self.builder.allocator, try self.builder.allocator.dupe(u8, arg_name));
             
-            // Check for default value
-            if (self.match(.equal)) {
-                const default_val = try self.parseExpression();
-                try defaults.append(self.builder.allocator, default_val);
+            if (seen_vararg) {
+                // Keyword-only argument
+                try kwonlyargs.append(self.builder.allocator, try self.builder.allocator.dupe(u8, arg_name));
+                if (self.match(.equal)) {
+                    const default_val = try self.parseExpression();
+                    try kwonly_defaults.append(self.builder.allocator, default_val);
+                } else {
+                    // No default for this kwonly arg — use None as sentinel
+                    try kwonly_defaults.append(self.builder.allocator, AST{ .Constant = .None });
+                }
+            } else {
+                try args.append(self.builder.allocator, try self.builder.allocator.dupe(u8, arg_name));
+                if (self.match(.equal)) {
+                    const default_val = try self.parseExpression();
+                    try defaults.append(self.builder.allocator, default_val);
+                }
             }
             
             if (self.peekType() == .comma) {
@@ -255,6 +357,10 @@ pub const Parser = struct {
             .name = try self.builder.allocator.dupe(u8, name_tok.lexeme),
             .args = try args.toOwnedSlice(self.builder.allocator),
             .defaults = try defaults.toOwnedSlice(self.builder.allocator),
+            .vararg = vararg,
+            .kwarg = kwarg,
+            .kwonlyargs = try kwonlyargs.toOwnedSlice(self.builder.allocator),
+            .kwonly_defaults = try kwonly_defaults.toOwnedSlice(self.builder.allocator),
             .body = body,
             .decorators = &[_]AST{},
         } };
@@ -409,14 +515,59 @@ pub const Parser = struct {
 
         // Try parsing Assignment: target = expr or target op= expr
         const state = self.saveState();
+        
+        // Handle tuple unpacking assignment: a, b = expr  (starts with identifier followed by comma)
+        if (self.peekType() == .identifier) {
+            const saved = self.saveState();
+            const first_name = self.current_token.lexeme;
+            self.advance();
+            if (self.peekType() == .comma) {
+                // Looks like tuple target: collect all targets
+                var targets_list = std.ArrayList(AST).empty;
+                defer targets_list.deinit(self.builder.allocator);
+                try targets_list.append(self.builder.allocator, AST{ .Name = first_name });
+                while (self.peekType() == .comma) {
+                    self.advance(); // consume comma
+                    if (self.peekType() == .equal) break; // trailing comma before =
+                    if (self.peekType() == .star) {
+                        self.advance();
+                        const starred_name = self.current_token.lexeme;
+                        try self.consume(.identifier, "Expect name after * in unpack target");
+                        const starred_ast_ptr = try self.builder.newAST(AST{ .Name = starred_name });
+                        try targets_list.append(self.builder.allocator, AST{ .Starred = .{ .value = starred_ast_ptr } });
+                    } else if (self.peekType() == .identifier) {
+                        const t = self.current_token.lexeme;
+                        self.advance();
+                        try targets_list.append(self.builder.allocator, AST{ .Name = t });
+                    } else {
+                        break;
+                    }
+                }
+                if (self.peekType() == .equal and targets_list.items.len > 1) {
+                    self.advance(); // consume =
+                    const val_expr = try self.parseExpression();
+                    const all_targets = try targets_list.toOwnedSlice(self.builder.allocator);
+                    return AST{ .UnpackAssign = .{
+                        .targets = all_targets,
+                        .value = try self.builder.newAST(val_expr),
+                    }};
+                }
+                // Not an unpack assignment — restore
+                self.restoreState(saved);
+            } else {
+                self.restoreState(saved);
+            }
+        }
+
         if (self.peekType() == .identifier) {
             const target_expr = self.parsePrimary() catch blk: {
                 self.restoreState(state);
                 break :blk null;
             };
             if (target_expr) |t| {
-                // Simple assignment
+                // Multi-target assignment: a = b = expr
                 if (self.match(.equal)) {
+                    // Peek ahead: is there another = after parsing an expression?
                     const expr = try self.parseExpression();
                     switch (t) {
                         .Name => |n| {
@@ -477,6 +628,22 @@ pub const Parser = struct {
                     switch (t) {
                         .Name => |n| {
                             return AST{ .AugAssign = .{ .target = n, .op = op, .value = try self.builder.newAST(expr) } };
+                        },
+                        .Attribute => |attr| {
+                            return AST{ .AugAssignAttr = .{
+                                .value = attr.value,
+                                .attr = attr.attr,
+                                .op = op,
+                                .expr = try self.builder.newAST(expr),
+                            } };
+                        },
+                        .Subscript => |sub| {
+                            return AST{ .AugAssignSubscript = .{
+                                .value = sub.value,
+                                .index = sub.index,
+                                .op = op,
+                                .expr = try self.builder.newAST(expr),
+                            } };
                         },
                         else => {
                             self.restoreState(state);
@@ -864,6 +1031,11 @@ pub const Parser = struct {
             self.advance();
             return AST{ .Constant = .{ .Bytes = lexeme } };
         }
+        if (self.peekType() == .fstring) {
+            const raw = self.current_token.lexeme;
+            self.advance();
+            return try self.parseFString(raw);
+        }
         if (self.peekType() == .identifier) {
             const name = self.current_token.lexeme;
             self.advance();
@@ -1030,6 +1202,74 @@ pub const Parser = struct {
         return error.ParseError;
     }
 
+    /// Parse an f-string literal: f"literal {expr} literal"
+    /// `raw` is the raw string content (without the f" prefix and " suffix)
+    fn parseFString(self: *Parser, raw: []const u8) anyerror!AST {
+        var parts = std.ArrayList(AST).empty;
+        errdefer parts.deinit(self.builder.allocator);
+
+        var i: usize = 0;
+        var lit_start: usize = 0;
+
+        while (i < raw.len) {
+            if (raw[i] == '{') {
+                if (i + 1 < raw.len and raw[i + 1] == '{') {
+                    // Escaped {{ — literal {
+                    if (i > lit_start) {
+                        const s = try self.builder.allocator.dupe(u8, raw[lit_start..i]);
+                        try parts.append(self.builder.allocator, AST{ .Constant = .{ .String = s } });
+                    }
+                    const s = try self.builder.allocator.dupe(u8, "{");
+                    try parts.append(self.builder.allocator, AST{ .Constant = .{ .String = s } });
+                    i += 2;
+                    lit_start = i;
+                    continue;
+                }
+                // Flush literal before {
+                if (i > lit_start) {
+                    const s = try self.builder.allocator.dupe(u8, raw[lit_start..i]);
+                    try parts.append(self.builder.allocator, AST{ .Constant = .{ .String = s } });
+                }
+                i += 1; // skip {
+                const expr_start = i;
+                var depth: usize = 1;
+                while (i < raw.len and depth > 0) {
+                    if (raw[i] == '{') depth += 1
+                    else if (raw[i] == '}') depth -= 1;
+                    if (depth > 0) i += 1 else break;
+                }
+                const expr_src = raw[expr_start..i];
+                i += 1; // skip }
+                lit_start = i;
+                // Parse the expression inside {}
+                // Use a sub-lexer + parser on expr_src
+                var sub_lexer = @import("../lexer/lexer.zig").Lexer.init(expr_src);
+                var sub_parser = Parser.init(&sub_lexer, self.builder.allocator);
+                const expr_ast = try sub_parser.parseExpression();
+                try parts.append(self.builder.allocator, expr_ast);
+            } else if (raw[i] == '}' and i + 1 < raw.len and raw[i + 1] == '}') {
+                // Escaped }}
+                if (i > lit_start) {
+                    const s = try self.builder.allocator.dupe(u8, raw[lit_start..i]);
+                    try parts.append(self.builder.allocator, AST{ .Constant = .{ .String = s } });
+                }
+                const s = try self.builder.allocator.dupe(u8, "}");
+                try parts.append(self.builder.allocator, AST{ .Constant = .{ .String = s } });
+                i += 2;
+                lit_start = i;
+            } else {
+                i += 1;
+            }
+        }
+        // Flush trailing literal
+        if (lit_start < raw.len) {
+            const s = try self.builder.allocator.dupe(u8, raw[lit_start..]);
+            try parts.append(self.builder.allocator, AST{ .Constant = .{ .String = s } });
+        }
+
+        return AST{ .FString = .{ .parts = try parts.toOwnedSlice(self.builder.allocator) } };
+    }
+
     fn parsePrimary(self: *Parser) anyerror!AST {
         var expr = try self.parseBase();
         
@@ -1037,9 +1277,46 @@ pub const Parser = struct {
             if (self.match(.lparen)) {
                 var args = std.ArrayList(AST).empty;
                 errdefer args.deinit(self.builder.allocator);
+                var starargs: ?*AST = null;
+                var kwargs: ?*AST = null;
                 while (self.peekType() != .rparen) {
-                    const arg = try self.parseExpression();
-                    try args.append(self.builder.allocator, arg);
+                    // Check for keyword argument: identifier '=' expression
+                    // Save lexer state to try to detect 'name=' pattern
+                    if (self.peekType() == .identifier) {
+                        const saved_lexer = self.lexer.save();
+                        const saved_tok = self.current_token;
+                        const kw_name = self.current_token.lexeme;
+                        self.advance();
+                        if (self.peekType() == .equal) {
+                            // This is a keyword argument
+                            self.advance(); // consume '='
+                            const val = try self.parseExpression();
+                            const kw_node = AST{ .Keyword = .{
+                                .name = try self.builder.allocator.dupe(u8, kw_name),
+                                .value = try self.builder.newAST(val),
+                            } };
+                            try args.append(self.builder.allocator, kw_node);
+                        } else {
+                            // Not a keyword arg — restore and parse as normal expression
+                            self.lexer.restore(saved_lexer);
+                            self.current_token = saved_tok;
+                            const arg = try self.parseExpression();
+                            try args.append(self.builder.allocator, arg);
+                        }
+                    } else if (self.peekType() == .double_star) {
+                        // **kwargs unpacking in call
+                        self.advance();
+                        const arg = try self.parseExpression();
+                        kwargs = try self.builder.newAST(arg);
+                    } else if (self.peekType() == .star) {
+                        // *args unpacking in call
+                        self.advance();
+                        const arg = try self.parseExpression();
+                        starargs = try self.builder.newAST(arg);
+                    } else {
+                        const arg = try self.parseExpression();
+                        try args.append(self.builder.allocator, arg);
+                    }
                     if (self.peekType() == .comma) {
                         self.advance();
                     } else if (self.peekType() != .rparen) {
@@ -1051,6 +1328,8 @@ pub const Parser = struct {
                 expr = AST{ .Call = .{
                     .func = try self.builder.newAST(expr),
                     .args = try args.toOwnedSlice(self.builder.allocator),
+                    .starargs = starargs,
+                    .kwargs = kwargs,
                 } };
             } else if (self.match(.dot)) {
                 const name = self.current_token.lexeme;
@@ -1200,8 +1479,13 @@ pub const Parser = struct {
         if (self.peekType() != .newline and self.peekType() != .eof and self.peekType() != .dedent) {
             const expr = try self.parseExpression();
             exc = try self.builder.newAST(expr);
+            // Handle 'raise X from Y' — consume 'from Y' and ignore the cause
+            if (self.peekType() == .kw_from) {
+                self.advance(); // consume 'from'
+                _ = try self.parseExpression(); // consume cause expression, ignore it
+            }
         }
-        return AST{ .Raise = .{ .exc = exc } };
+        return AST{ .Raise = .{ .exc = exc, .cause = null } };
     }
 
     fn parseNonlocalStatement(self: *Parser) anyerror!AST {

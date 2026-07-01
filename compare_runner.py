@@ -21,6 +21,7 @@ test_files = [
     "test_with.py",
     "test_generators.py",
     "test_nonlocal.py",
+    "test_cheatsheet.py",
     "benchmark.py"
 ]
 

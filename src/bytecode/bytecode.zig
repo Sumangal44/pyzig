@@ -74,6 +74,15 @@ pub const Opcode = enum(u8) {
     BEFORE_WITH,
     YIELD_VALUE,
     EXIT_WITH,
+
+    // Phase 5 opcodes — *args/**kwargs, unpacking, augmented attr/subscr
+    UNPACK_SEQUENCE,       // arg = expected count; pop iterable, push N items
+    CALL_EX,              // arg = has_kwargs (0 or 1); TOS[0]=callable, TOS[1]=args tuple, TOS[2]=kwargs dict if has_kwargs
+    LIST_EXTEND,           // extend list at TOS[arg] with iterable at TOS
+    DICT_MERGE,            // merge dict at TOS[arg] with dict at TOS
+    STORE_SUBSCR_AUG,      // for d[k] op= v  (load + op + store in one sequence)
+    STORE_ATTR_AUG,        // for obj.attr op= v
+    SWAP,                  // swaps TOS and TOS1
 };
 
 pub const Instruction = struct {
@@ -87,7 +96,10 @@ pub const PyCodeObject = struct {
     names: [][]const u8,
     argcount: usize = 0,
     varnames: [][]const u8 = &[_][]const u8{},
-    is_generator: bool = false, // local variable names for arguments
+    is_generator: bool = false,
+    vararg_name: ?[]const u8 = null,  // name for *args parameter
+    kwarg_name: ?[]const u8 = null,   // name for **kwargs parameter
+    kwonlycount: usize = 0,            // number of keyword-only args (after vararg)
 
     pub fn deinit(self: *PyCodeObject, allocator: std.mem.Allocator, mm: *PyMemoryManager) void {
         allocator.free(self.instructions);
@@ -104,6 +116,12 @@ pub const PyCodeObject = struct {
         }
         if (self.varnames.len > 0) {
             allocator.free(self.varnames);
+        }
+        if (self.vararg_name) |va| {
+            allocator.free(va);
+        }
+        if (self.kwarg_name) |ka| {
+            allocator.free(ka);
         }
     }
 };

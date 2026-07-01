@@ -14,6 +14,7 @@ pub const TokenType = enum {
     number_float,
     number_complex,
     string,
+    fstring,
     bytes,
 
     // Operators and delimiters
@@ -404,20 +405,79 @@ pub const Lexer = struct {
                     }
                     return .{ .type = .at, .lexeme = "@", .line = start_line, .column = start_col };
                 },
-                '\'' , '"' => {
-                    // String literal
+                '\'', '"' => {
+                    // Check for triple-quoted string
                     const quote = c;
+                    if (self.peek() == quote and self.peekNext() == quote) {
+                        _ = self.advance(); // second quote
+                        _ = self.advance(); // third quote
+                        // Read until triple-close
+                        while (self.index < self.source.len) {
+                            const ch = self.advance();
+                            if (ch == quote and self.peek() == quote and self.peekNext() == quote) {
+                                _ = self.advance();
+                                _ = self.advance();
+                                break;
+                            }
+                        }
+                        const lexeme = self.source[start_idx + 4 .. self.index - 3];
+                        return .{ .type = .string, .lexeme = lexeme, .line = start_line, .column = start_col };
+                    }
+                    // Single-quoted string literal
                     while (self.index < self.source.len and self.peek() != quote) {
-                        _ = self.advance();
+                        if (self.peek() == '\\') _ = self.advance(); // skip escape
+                        if (self.index < self.source.len) _ = self.advance();
                     }
                     if (self.index >= self.source.len) {
                         return .{ .type = .invalid, .lexeme = "Unterminated string literal", .line = start_line, .column = start_col };
                     }
-                    _ = self.advance(); // consume quote
+                    _ = self.advance(); // consume closing quote
                     const lexeme = self.source[start_idx + 1 .. self.index - 1];
                     return .{ .type = .string, .lexeme = lexeme, .line = start_line, .column = start_col };
                 },
                 else => {
+                    // f-string prefix: f"..." or f'...'
+                    if ((c == 'f' or c == 'F') and (self.peek() == '\'' or self.peek() == '"')) {
+                        const quote = self.advance();
+                        // Check for triple-quoted f-string
+                        if (self.peek() == quote and self.peekNext() == quote) {
+                            _ = self.advance();
+                            _ = self.advance();
+                            while (self.index < self.source.len) {
+                                const ch = self.advance();
+                                if (ch == quote and self.peek() == quote and self.peekNext() == quote) {
+                                    _ = self.advance();
+                                    _ = self.advance();
+                                    break;
+                                }
+                            }
+                            const lexeme = self.source[start_idx + 5 .. self.index - 3];
+                            return .{ .type = .fstring, .lexeme = lexeme, .line = start_line, .column = start_col };
+                        }
+                        while (self.index < self.source.len and self.peek() != quote) {
+                            if (self.peek() == '\\') _ = self.advance(); // skip escape
+                            if (self.index < self.source.len) _ = self.advance();
+                        }
+                        if (self.index >= self.source.len) {
+                            return .{ .type = .invalid, .lexeme = "Unterminated f-string literal", .line = start_line, .column = start_col };
+                        }
+                        _ = self.advance(); // consume closing quote
+                        const lexeme = self.source[start_idx + 2 .. self.index - 1];
+                        return .{ .type = .fstring, .lexeme = lexeme, .line = start_line, .column = start_col };
+                    }
+                    // r-string prefix: r"..." or r'...' (raw string, treat as plain string)
+                    if ((c == 'r' or c == 'R') and (self.peek() == '\'' or self.peek() == '"')) {
+                        const quote = self.advance();
+                        while (self.index < self.source.len and self.peek() != quote) {
+                            _ = self.advance(); // no escape processing for raw strings
+                        }
+                        if (self.index >= self.source.len) {
+                            return .{ .type = .invalid, .lexeme = "Unterminated string literal", .line = start_line, .column = start_col };
+                        }
+                        _ = self.advance(); // consume closing quote
+                        const lexeme = self.source[start_idx + 2 .. self.index - 1];
+                        return .{ .type = .string, .lexeme = lexeme, .line = start_line, .column = start_col };
+                    }
                     if ((c == 'b' or c == 'B') and (self.peek() == '\'' or self.peek() == '"')) {
                         const quote = self.advance();
                         while (self.index < self.source.len and self.peek() != quote) {

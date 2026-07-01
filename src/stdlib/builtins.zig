@@ -24,6 +24,7 @@ const class_mod = @import("../objects/class.zig");
 const PyClass_Type = &class_mod.PyClass_Type;
 const PyInstance_Type = &class_mod.PyInstance_Type;
 const PyMethod_Type = &class_mod.PyMethod_Type;
+const PyClassObject = class_mod.PyClassObject;
 const collections = @import("../objects/collections.zig");
 const PyListObject = collections.PyListObject;
 const PyTupleObject = collections.PyTupleObject;
@@ -53,6 +54,7 @@ pub const PyTypeWrapper_Type = PyTypeObject{
     .tp_dealloc = type_wrapper_dealloc,
     .tp_repr = type_wrapper_repr,
     .tp_str = type_wrapper_repr,
+    .tp_richcompare = type_wrapper_richcompare,
 };
 
 fn type_wrapper_dealloc(self: *PyObject, mm: *PyMemoryManager) void {
@@ -65,6 +67,42 @@ fn type_wrapper_repr(self: *PyObject, mm: *PyMemoryManager) anyerror!*PyObject {
     var buf: [128]u8 = undefined;
     const name = std.fmt.bufPrint(&buf, "<class '{s}'>", .{obj.type_ptr.name}) catch "<class>";
     return try PyStringObject.create(name, mm);
+}
+
+pub fn matchBuiltinType(func_name: []const u8) ?*const PyTypeObject {
+    if (std.mem.eql(u8, func_name, "list")) return PyList_Type;
+    if (std.mem.eql(u8, func_name, "tuple")) return PyTuple_Type;
+    if (std.mem.eql(u8, func_name, "dict")) return PyDict_Type;
+    if (std.mem.eql(u8, func_name, "str")) return PyString_Type;
+    if (std.mem.eql(u8, func_name, "int")) return PyInt_Type;
+    if (std.mem.eql(u8, func_name, "float")) return PyFloat_Type;
+    if (std.mem.eql(u8, func_name, "bool")) return PyBool_Type;
+    if (std.mem.eql(u8, func_name, "set")) return PySet_Type;
+    if (std.mem.eql(u8, func_name, "frozenset")) return PyFrozenSet_Type;
+    if (std.mem.eql(u8, func_name, "bytes")) return PyBytes_Type;
+    if (std.mem.eql(u8, func_name, "bytearray")) return PyByteArray_Type;
+    return null;
+}
+
+fn type_wrapper_richcompare(self: *PyObject, other: *PyObject, op: @import("../objects/object.zig").CompareOp, mm: *PyMemoryManager) anyerror!*PyObject {
+    _ = mm;
+    if (op != .Eq and op != .Ne) return error.TypeError;
+    var is_eq = false;
+    if (other.type_obj == &PyTypeWrapper_Type) {
+        const a = self.as(PyTypeWrapper);
+        const b = other.as(PyTypeWrapper);
+        is_eq = (a.type_ptr == b.type_ptr);
+    } else if (other.type_obj == &@import("../objects/function.zig").PyBuiltinFunction_Type) {
+        const a = self.as(PyTypeWrapper);
+        const b = other.as(@import("../objects/function.zig").PyBuiltinFunctionObject);
+        if (matchBuiltinType(b.name)) |t_ptr| {
+            is_eq = (a.type_ptr == t_ptr);
+        }
+    }
+    const result = if (op == .Eq) is_eq else !is_eq;
+    const res = if (result) PyTrue else PyFalse;
+    res.incRef();
+    return res;
 }
 
 // len(x)
@@ -91,6 +129,19 @@ pub fn builtinLen(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
         size = obj.as(primitives.PyBytesObject).len;
     } else if (obj.type_obj == PyByteArray_Type) {
         size = obj.as(primitives.PyByteArrayObject).size;
+    } else if (obj.type_obj == PyInstance_Type) {
+        const inst = obj.as(class_mod.PyInstanceObject);
+        if (try vm.lookupClassAttribute(inst.class_obj, "__len__")) |len_method| {
+            defer len_method.decRef(vm.mm);
+            const bound_len = try class_mod.PyMethodObject.create(obj, len_method, vm.mm);
+            defer bound_len.base.decRef(vm.mm);
+            const res = try vm.callCallable(&bound_len.base, &[_]*PyObject{});
+            defer res.decRef(vm.mm);
+            if (res.type_obj != &primitives.PyInt_Type) return error.TypeError;
+            size = @intCast(res.as(PyIntObject).value);
+        } else {
+            return error.TypeError;
+        }
     } else {
         return error.TypeError;
     }
@@ -148,7 +199,10 @@ pub fn builtinRange(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject
 pub fn builtinStr(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
     const VM = @import("../vm/vm.zig").VM;
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
-    if (args.len != 1) return error.TypeError;
+    if (args.len > 1) return error.TypeError;
+    if (args.len == 0) {
+        return try PyStringObject.create("", vm.mm);
+    }
     
     const obj = args[0];
     if (obj.type_obj.tp_str) |str_fn| {
@@ -187,7 +241,10 @@ pub fn builtinPrint(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject
 pub fn builtinInt(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
     const VM = @import("../vm/vm.zig").VM;
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
-    if (args.len != 1) return error.TypeError;
+    if (args.len > 1) return error.TypeError;
+    if (args.len == 0) {
+        return try PyIntObject.create(0, vm.mm);
+    }
     const obj = args[0];
     if (obj.type_obj == PyInt_Type) {
         obj.incRef();
@@ -210,7 +267,11 @@ pub fn builtinInt(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
 pub fn builtinFloat(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
     const VM = @import("../vm/vm.zig").VM;
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
-    if (args.len != 1) return error.TypeError;
+    if (args.len > 1) return error.TypeError;
+    if (args.len == 0) {
+        const primitives_mod = @import("../objects/primitives.zig");
+        return try primitives_mod.PyFloatObject.create(0.0, vm.mm);
+    }
     const obj = args[0];
     const primitives_mod = @import("../objects/primitives.zig");
     if (obj.type_obj == PyFloat_Type) {
@@ -268,7 +329,11 @@ pub fn builtinComplex(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObje
 // bool(x)
 pub fn builtinBool(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
     _ = vm_opaque;
-    if (args.len != 1) return error.TypeError;
+    if (args.len > 1) return error.TypeError;
+    if (args.len == 0) {
+        PyFalse.incRef();
+        return PyFalse;
+    }
     const obj = args[0];
     // Simple truthiness
     if (obj == PyTrue or obj == PyFalse) {
@@ -684,6 +749,57 @@ pub fn builtinInput(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject
     const line = line_writer.written();
     const line_trimmed = std.mem.trim(u8, line, " \r\n");
     return try PyStringObject.create(line_trimmed, vm.mm);
+}
+
+pub fn builtinOpen(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len < 1 or args.len > 2) return error.TypeError;
+    
+    const path_obj = args[0];
+    if (path_obj.type_obj != PyString_Type) return error.TypeError;
+    const path = path_obj.as(PyStringObject).value();
+
+    var mode: []const u8 = "r";
+    if (args.len == 2) {
+        if (args[1].type_obj != PyString_Type) return error.TypeError;
+        mode = args[1].as(PyStringObject).value();
+    }
+
+    const cwd = std.Io.Dir.cwd();
+    var file: std.Io.File = undefined;
+    var pos: u64 = 0;
+    if (std.mem.eql(u8, mode, "r")) {
+        file = try cwd.openFile(vm.io, path, .{ .mode = .read_only });
+    } else if (std.mem.eql(u8, mode, "w")) {
+        file = try cwd.createFile(vm.io, path, .{});
+    } else if (std.mem.eql(u8, mode, "a")) {
+        file = cwd.openFile(vm.io, path, .{ .mode = .read_write }) catch try cwd.createFile(vm.io, path, .{});
+        pos = try file.length(vm.io);
+    } else {
+        return error.ValueError;
+    }
+
+    const file_mod = @import("../objects/file.zig");
+    const file_obj = try file_mod.PyFileObject.create(file, vm.io, mode, pos, vm.mm);
+    return &file_obj.base;
+}
+
+pub fn builtinHelp(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 1) return error.TypeError;
+    const obj = args[0];
+    try vm.stdout_writer.print("Help on {s} object:\n\n", .{obj.type_obj.name});
+    if (obj.type_obj.tp_repr) |repr_fn| {
+        const repr_str = try repr_fn(obj, vm.mm);
+        defer repr_str.decRef(vm.mm);
+        try vm.stdout_writer.print("{s}\n", .{repr_str.as(PyStringObject).value()});
+    } else {
+        try vm.stdout_writer.print("<{s} object>\n", .{obj.type_obj.name});
+    }
+    PyNone.incRef();
+    return PyNone;
 }
 
 fn isSubclass(a: *PyObject, b: *PyObject) bool {
@@ -1307,6 +1423,83 @@ pub fn builtinAscii(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject
         return try asciiEscape(str_val.as(PyStringObject).value(), vm.mm);
     }
     return try PyStringObject.create(obj.type_obj.name, vm.mm);
+}
+
+pub fn builtinSuper(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    
+    var self_obj: *PyObject = undefined;
+    var lookup_class: ?*PyClassObject = null;
+    
+    if (args.len == 0) {
+        // Dynamic zero-argument lookup: retrieve calling frame
+        if (vm.frame_count < 1) return error.RuntimeError;
+        const calling_frame = &vm.frames[vm.frame_count - 1];
+        
+        // Grab 'self' from fastlocals[0]
+        if (calling_frame.fastlocals.len == 0 or calling_frame.fastlocals[0] == null) {
+            std.debug.print("RuntimeError: super() called outside of method context (no self argument)\n", .{});
+            return error.RuntimeError;
+        }
+        self_obj = calling_frame.fastlocals[0].?;
+        
+        const func = calling_frame.func orelse {
+            std.debug.print("RuntimeError: super() called outside of method context (no active function)\n", .{});
+            return error.RuntimeError;
+        };
+        
+        // Find which class defines `func`
+        if (self_obj.type_obj == &@import("../objects/class.zig").PyInstance_Type) {
+            const inst = self_obj.as(@import("../objects/class.zig").PyInstanceObject);
+            var current_class: ?*PyClassObject = inst.class_obj;
+            while (current_class) |cls| {
+                const dict = cls.dict.as(@import("../objects/collections.zig").PyDictObject);
+                var idx: usize = 0;
+                var found = false;
+                while (idx < dict.entries_size) : (idx += 1) {
+                    const entry = &dict.entries[idx];
+                    if (entry.key != null and entry.value != null and entry.value.? == &func.base) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) {
+                    if (cls.base_class) |bc| {
+                        lookup_class = bc.as(PyClassObject);
+                    }
+                    break;
+                }
+                current_class = if (cls.base_class) |bc| bc.as(PyClassObject) else null;
+            }
+            if (lookup_class == null) {
+                // Default fallback if not found in chain
+                if (inst.class_obj.base_class) |bc| {
+                    lookup_class = bc.as(PyClassObject);
+                }
+            }
+        } else {
+            std.debug.print("TypeError: super() argument 1 must be instance, not '{s}'\n", .{self_obj.type_obj.name});
+            return error.TypeError;
+        }
+    } else if (args.len == 2) {
+        const cls_arg = args[0];
+        self_obj = args[1];
+        if (cls_arg.type_obj == PyClass_Type) {
+            const cls = cls_arg.as(PyClassObject);
+            if (cls.base_class) |bc| {
+                lookup_class = bc.as(PyClassObject);
+            }
+        } else {
+            return error.TypeError;
+        }
+    } else {
+        return error.TypeError;
+    }
+    
+    const super_class = @import("../objects/class.zig");
+    const super_obj = try super_class.PySuperObject.create(self_obj, lookup_class, vm.mm);
+    return &super_obj.base;
 }
 
 pub fn builtinIssubclass(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
@@ -1990,6 +2183,24 @@ pub fn listClearMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObj
     self_obj.as(collections.PyListObject).clear(vm.mm);
     PyNone.incRef();
     return PyNone;
+}
+
+pub fn listCopyMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 1) return error.TypeError;
+    const self_obj = args[0];
+    if (self_obj.type_obj != PyList_Type) return error.TypeError;
+    const list = self_obj.as(collections.PyListObject);
+    const new_list = try collections.PyListObject.create(0, vm.mm);
+    errdefer new_list.base.decRef(vm.mm);
+    if (list.size > 0) {
+        for (0..list.size) |i| {
+            const item = list.items.?[i];
+            try new_list.append(item, vm.mm);
+        }
+    }
+    return &new_list.base;
 }
 
 pub fn dictKeysMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
@@ -2786,6 +2997,40 @@ pub fn stringIsupperMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*P
     return if (has_cased) PyTrue else PyFalse;
 }
 
+fn addDictKeys(result: *PyListObject, dict_obj: *PyObject, vm: *anyopaque) anyerror!void {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm_ptr: *VM = @ptrCast(@alignCast(vm));
+    const dict = dict_obj.as(PyDictObject);
+    var i: usize = 0;
+    while (i < dict.entries_size) : (i += 1) {
+        if (dict.entries[i].key) |key| {
+            if (key.type_obj == PyString_Type) {
+                var found = false;
+                var j: usize = 0;
+                while (j < result.size) : (j += 1) {
+                    const item = result.items.?[j];
+                    if (item.type_obj == PyString_Type) {
+                        if (std.mem.eql(u8, item.as(PyStringObject).value(), key.as(PyStringObject).value())) {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (!found) {
+                    try result.append(key, vm_ptr.mm);
+                }
+            }
+        }
+    }
+}
+
+fn compareStrings(context: void, a: *PyObject, b: *PyObject) bool {
+    _ = context;
+    const sa = a.as(PyStringObject).value();
+    const sb = b.as(PyStringObject).value();
+    return std.mem.lessThan(u8, sa, sb);
+}
+
 pub fn builtinDir(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
     const VM = @import("../vm/vm.zig").VM;
     const vm: *VM = @ptrCast(@alignCast(vm_opaque));
@@ -2813,7 +3058,41 @@ pub fn builtinDir(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
         } else if (o.type_obj == PyInt_Type) {
             const names = [_][]const u8{"bit_length", "to_bytes", "from_bytes", "as_integer_ratio"};
             for (names) |n| { const s = try PyStringObject.create(n, vm.mm); defer s.decRef(vm.mm); try result.append(s, vm.mm); }
+        } else if (o.type_obj == PyInstance_Type) {
+            const inst = o.as(class_mod.PyInstanceObject);
+            try addDictKeys(result, inst.dict, vm_opaque);
+            var curr_class: ?*class_mod.PyClassObject = inst.class_obj;
+            while (curr_class) |cls| {
+                try addDictKeys(result, cls.dict, vm_opaque);
+                if (cls.base_class) |bc| {
+                    if (bc.type_obj == PyClass_Type) {
+                        curr_class = bc.as(class_mod.PyClassObject);
+                    } else {
+                        curr_class = null;
+                    }
+                } else {
+                    curr_class = null;
+                }
+            }
+        } else if (o.type_obj == PyClass_Type) {
+            const class_obj = o.as(class_mod.PyClassObject);
+            var curr_class: ?*class_mod.PyClassObject = class_obj;
+            while (curr_class) |cls| {
+                try addDictKeys(result, cls.dict, vm_opaque);
+                if (cls.base_class) |bc| {
+                    if (bc.type_obj == PyClass_Type) {
+                        curr_class = bc.as(class_mod.PyClassObject);
+                    } else {
+                        curr_class = null;
+                    }
+                } else {
+                    curr_class = null;
+                }
+            }
         }
+    }
+    if (result.size > 0) {
+        std.mem.sort(*PyObject, result.items.?[0..result.size], {}, compareStrings);
     }
     return &result.base;
 }

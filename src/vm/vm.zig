@@ -2,6 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const PyMemoryManager = @import("../memory/allocator.zig").PyMemoryManager;
 const PyObject = @import("../objects/object.zig").PyObject;
+const PyTypeObject = @import("../objects/object.zig").PyTypeObject;
 const CompareOp = @import("../objects/object.zig").CompareOp;
 const primitives = @import("../objects/primitives.zig");
 const PyNone = primitives.PyNone;
@@ -18,6 +19,17 @@ const PyBytes_Type = &primitives.PyBytes_Type;
 const PyByteArray_Type = &primitives.PyByteArray_Type;
 const bytecode = @import("../bytecode/bytecode.zig");
 const Opcode = bytecode.Opcode;
+
+fn swapOp(op: CompareOp) CompareOp {
+    return switch (op) {
+        .Lt => .Gt,
+        .Le => .Ge,
+        .Eq => .Eq,
+        .Ne => .Ne,
+        .Gt => .Lt,
+        .Ge => .Le,
+    };
+}
 const Instruction = bytecode.Instruction;
 const PyCodeObject = bytecode.PyCodeObject;
 const PyCodeObjectWrapper = bytecode.PyCodeObjectWrapper;
@@ -46,6 +58,8 @@ const PyMethodObject = class_mod.PyMethodObject;
 const PyMethod_Type = &class_mod.PyMethod_Type;
 const PyClass_Type = &class_mod.PyClass_Type;
 const PyInstance_Type = &class_mod.PyInstance_Type;
+const PySuperObject = class_mod.PySuperObject;
+const PySuper_Type = &class_mod.PySuper_Type;
 const exception_mod = @import("../objects/exception.zig");
 const PyExceptionObject = exception_mod.PyExceptionObject;
 const PyException_Type = &exception_mod.PyException_Type;
@@ -200,6 +214,12 @@ pub fn isTrue(obj: *PyObject) bool {
 }
 
 pub const VM = struct {
+    pub const DiagnosticMode = enum {
+        none,
+        hinglish,
+        jugaad,
+    };
+
     allocator: std.mem.Allocator,
     mm: *PyMemoryManager,
     frames: [64]PyFrameObject = undefined,
@@ -209,6 +229,7 @@ pub const VM = struct {
     last_result: ?*PyObject = null,
     suppress_exception_handling: bool = false,
     io: std.Io,
+    diagnostic_mode: DiagnosticMode = .none,
 
     fn buildClass(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
         // args[0] = body func, args[1] = class name str, args[2]? = base class
@@ -311,6 +332,7 @@ pub const VM = struct {
             .stdout_writer = stdout_writer,
             .globals = std.StringHashMap(*PyObject).init(allocator),
             .io = io,
+            .diagnostic_mode = .none,
         };
         errdefer vm.deinit();
         
@@ -369,6 +391,9 @@ pub const VM = struct {
         try vm.registerBuiltin("locals", builtins.builtinLocals);
         try vm.registerBuiltin("vars", builtins.builtinVars);
         try vm.registerBuiltin("issubclass", builtins.builtinIssubclass);
+        try vm.registerBuiltin("open", builtins.builtinOpen);
+        try vm.registerBuiltin("help", builtins.builtinHelp);
+        try vm.registerBuiltin("super", builtins.builtinSuper);
         try vm.registerBuiltin("__build_class__", buildClass);
         try vm.registerExceptionClass();
         
@@ -445,9 +470,8 @@ pub const VM = struct {
         }
     }
 
-    fn lookupClassAttribute(self: *VM, class_obj: *PyClassObject, name: []const u8) anyerror!?*PyObject {
-        const key_str = try PyStringObject.create(name, self.mm);
-        defer key_str.decRef(self.mm);
+    pub fn lookupClassAttribute(self: *VM, class_obj: *PyClassObject, name: []const u8) anyerror!?*PyObject {
+        const key_str = try self.mm.internString(name);
         
         var current: ?*PyClassObject = class_obj;
         while (current) |curr| {
@@ -472,22 +496,6 @@ pub const VM = struct {
 
     fn isExceptionMatch(self: *VM, exc: *PyObject, type_name: []const u8) bool {
         _ = self;
-        if (exc.type_obj == PyException_Type or
-            exc.type_obj == PyAssertionError_Type or
-            exc.type_obj == PyTypeError_Type or
-            exc.type_obj == PyValueError_Type or
-            exc.type_obj == PyKeyError_Type or
-            exc.type_obj == PyIndexError_Type or
-            exc.type_obj == PyStopIteration_Type or
-            exc.type_obj == PyAttributeError_Type or
-            exc.type_obj == PyNameError_Type or
-            exc.type_obj == PyRuntimeError_Type)
-        {
-            const exc_type_name = exc.type_obj.name;
-            if (std.mem.eql(u8, exc_type_name, type_name)) return true;
-            if (exc.type_obj == PyAssertionError_Type and std.mem.eql(u8, type_name, "Exception")) return true;
-            return false;
-        }
         // User-defined class instance (PyInstanceObject wraps PyClassObject)
         if (exc.type_obj == PyInstance_Type) {
             const inst = exc.as(PyInstanceObject);
@@ -519,14 +527,50 @@ pub const VM = struct {
                 }
             }
         }
+        const exc_type_name = exc.type_obj.name;
+        if (std.mem.eql(u8, exc_type_name, type_name)) return true;
+        if (std.mem.eql(u8, type_name, "Exception")) return true;
         return false;
     }
 
-    pub fn loadAttribute(self: *VM, inst: *PyObject, name: []const u8) anyerror!*PyObject {
+    fn returnAttributeError(self: *VM, inst: *PyObject, name: []const u8) anyerror!*PyObject {
+        var buf: [256]u8 = undefined;
+        const type_name = if (inst.type_obj == PyInstance_Type)
+            inst.as(PyInstanceObject).class_obj.name.as(PyStringObject).value()
+        else
+            inst.type_obj.name;
+        const msg = std.fmt.bufPrint(&buf, "AttributeError: '{s}' object has no attribute '{s}'. (Did you typo it, or did it vanish into thin air?)", .{type_name, name}) catch "AttributeError: missing attribute";
+        try self.raiseAttributeError(msg);
+        return error.PythonException;
+    }
 
-        const key_str = try PyStringObject.create(name, self.mm);
-        defer key_str.decRef(self.mm);
+    pub fn loadAttribute(self: *VM, inst: *PyObject, name: []const u8) anyerror!*PyObject {
+        const key_str = try self.mm.internString(name);
         
+        if (inst.type_obj == PySuper_Type) {
+            const super_obj = inst.as(PySuperObject);
+            if (super_obj.lookup_class) |lookup_class| {
+                if (try self.lookupClassAttribute(lookup_class, name)) |val| {
+                    if (val.type_obj == PyProperty_Type) {
+                        const prop = val.as(@import("../objects/property.zig").PyPropertyObject);
+                        val.decRef(self.mm);
+                        if (prop.fget) |fget| {
+                            var call_args = [_]*PyObject{super_obj.self_obj};
+                            return try self.callCallable(fget, &call_args);
+                        }
+                        return try self.returnAttributeError(inst, name);
+                    }
+                    if (val.type_obj == PyFunction_Type) {
+                        const bound = try PyMethodObject.create(super_obj.self_obj, val, self.mm);
+                        val.decRef(self.mm);
+                        return &bound.base;
+                    }
+                    return val;
+                }
+            }
+            return try self.returnAttributeError(inst, name);
+        }
+
         if (inst.type_obj == PyInstance_Type) {
             const instance = inst.as(PyInstanceObject);
             const dict = instance.dict.as(PyDictObject);
@@ -543,7 +587,7 @@ pub const VM = struct {
                         var call_args = [_]*PyObject{inst};
                         return try self.callCallable(fget, &call_args);
                     }
-                    return error.AttributeError;
+                    return try self.returnAttributeError(inst, name);
                 }
                 if (val.type_obj == PyFunction_Type) {
                     const bound = try PyMethodObject.create(inst, val, self.mm);
@@ -553,8 +597,8 @@ pub const VM = struct {
                 return val;
             }
             
-            std.debug.print("AttributeError: '{s}' object has no attribute '{s}'\n", .{instance.class_obj.name.as(PyStringObject).value(), name});
-            return error.AttributeError;
+
+            return try self.returnAttributeError(inst, name);
         } else if (inst.type_obj == PyModule_Type) {
             const module = inst.as(@import("../import_system/import.zig").PyModuleObject);
             const dict = module.dict.as(PyDictObject);
@@ -562,8 +606,8 @@ pub const VM = struct {
                 val.incRef();
                 return val;
             }
-            std.debug.print("AttributeError: module '{s}' has no attribute '{s}'\n", .{module.name.as(PyStringObject).value(), name});
-            return error.AttributeError;
+
+            return try self.returnAttributeError(inst, name);
         } else if (inst.type_obj == PySet_Type) {
             const builtins = @import("../stdlib/builtins.zig");
             var method_func: *PyObject = undefined;
@@ -607,8 +651,7 @@ pub const VM = struct {
                 const builtin_func = try PyBuiltinFunctionObject.create("symmetric_difference_update", builtins.setSymmetricDifferenceUpdateMethod, self.mm);
                 method_func = &builtin_func.base;
             } else {
-                std.debug.print("AttributeError: 'set' object has no attribute '{s}'\n", .{name});
-                return error.AttributeError;
+                return try self.returnAttributeError(inst, name);
             }
             const bound = try PyMethodObject.create(inst, method_func, self.mm);
             method_func.decRef(self.mm);
@@ -646,9 +689,11 @@ pub const VM = struct {
             } else if (std.mem.eql(u8, name, "clear")) {
                 const builtin_func = try PyBuiltinFunctionObject.create("clear", builtins.listClearMethod, self.mm);
                 method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "copy")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("copy", builtins.listCopyMethod, self.mm);
+                method_func = &builtin_func.base;
             } else {
-                std.debug.print("AttributeError: 'list' object has no attribute '{s}'\n", .{name});
-                return error.AttributeError;
+                return try self.returnAttributeError(inst, name);
             }
             const bound = try PyMethodObject.create(inst, method_func, self.mm);
             method_func.decRef(self.mm);
@@ -687,8 +732,7 @@ pub const VM = struct {
                 const builtin_func = try PyBuiltinFunctionObject.create("popitem", builtins.dictPopitemMethod, self.mm);
                 method_func = &builtin_func.base;
             } else {
-                std.debug.print("AttributeError: 'dict' object has no attribute '{s}'\n", .{name});
-                return error.AttributeError;
+                return try self.returnAttributeError(inst, name);
             }
             const bound = try PyMethodObject.create(inst, method_func, self.mm);
             method_func.decRef(self.mm);
@@ -793,8 +837,7 @@ pub const VM = struct {
                 const builtin_func = try PyBuiltinFunctionObject.create("splitlines", builtins.stringSplitlinesMethod, self.mm);
                 method_func = &builtin_func.base;
             } else {
-                std.debug.print("AttributeError: 'str' object has no attribute '{s}'\n", .{name});
-                return error.AttributeError;
+                return try self.returnAttributeError(inst, name);
             }
             const bound = try PyMethodObject.create(inst, method_func, self.mm);
             method_func.decRef(self.mm);
@@ -809,8 +852,7 @@ pub const VM = struct {
                 const builtin_func = try PyBuiltinFunctionObject.create("hex", builtins.bytesHexMethod, self.mm);
                 method_func = &builtin_func.base;
             } else {
-                std.debug.print("AttributeError: 'bytes' object has no attribute '{s}'\n", .{name});
-                return error.AttributeError;
+                return try self.returnAttributeError(inst, name);
             }
             const bound = try PyMethodObject.create(inst, method_func, self.mm);
             method_func.decRef(self.mm);
@@ -828,8 +870,37 @@ pub const VM = struct {
                 const builtin_func = try PyBuiltinFunctionObject.create("hex", builtins.bytesHexMethod, self.mm);
                 method_func = &builtin_func.base;
             } else {
-                std.debug.print("AttributeError: 'bytearray' object has no attribute '{s}'\n", .{name});
-                return error.AttributeError;
+                return try self.returnAttributeError(inst, name);
+            }
+            const bound = try PyMethodObject.create(inst, method_func, self.mm);
+            method_func.decRef(self.mm);
+            return &bound.base;
+        } else if (inst.type_obj == &@import("../objects/file.zig").PyFile_Type) {
+            const file_mod = @import("../objects/file.zig");
+            var method_func: *PyObject = undefined;
+            if (std.mem.eql(u8, name, "read")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("read", file_mod.fileReadMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "write")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("write", file_mod.fileWriteMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "close")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("close", file_mod.fileCloseMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "readlines")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("readlines", file_mod.fileReadlinesMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "writelines")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("writelines", file_mod.fileWritelinesMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "__enter__")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("__enter__", file_mod.fileEnterMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else if (std.mem.eql(u8, name, "__exit__")) {
+                const builtin_func = try PyBuiltinFunctionObject.create("__exit__", file_mod.fileExitMethod, self.mm);
+                method_func = &builtin_func.base;
+            } else {
+                return try self.returnAttributeError(inst, name);
             }
             const bound = try PyMethodObject.create(inst, method_func, self.mm);
             method_func.decRef(self.mm);
@@ -844,8 +915,7 @@ pub const VM = struct {
                 const builtin_func = try PyBuiltinFunctionObject.create("count", builtins.tupleCountMethod, self.mm);
                 method_func = &builtin_func.base;
             } else {
-                std.debug.print("AttributeError: 'tuple' object has no attribute '{s}'\n", .{name});
-                return error.AttributeError;
+                return try self.returnAttributeError(inst, name);
             }
             const bound = try PyMethodObject.create(inst, method_func, self.mm);
             method_func.decRef(self.mm);
@@ -860,8 +930,7 @@ pub const VM = struct {
                 const builtin_func = try PyBuiltinFunctionObject.create("to_bytes", builtins.intToBytesMethod, self.mm);
                 method_func = &builtin_func.base;
             } else {
-                std.debug.print("AttributeError: 'int' object has no attribute '{s}'\n", .{name});
-                return error.AttributeError;
+                return try self.returnAttributeError(inst, name);
             }
             const bound = try PyMethodObject.create(inst, method_func, self.mm);
             method_func.decRef(self.mm);
@@ -878,24 +947,42 @@ pub const VM = struct {
                 const bfunc = try PyBuiltinFunctionObject.create("bytes.fromhex", builtins.bytesFromHexMethod, self.mm);
                 return &bfunc.base;
             }
-            std.debug.print("TypeError: '{s}' object has no attributes\n", .{inst.type_obj.name});
-            return error.TypeError;
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "TypeError: You tried to access attributes on a '{s}' object, but it has none! (It's like asking a fish to climb a tree!)", .{inst.type_obj.name}) catch "TypeError: object has no attributes";
+            try self.raiseTypeError(msg);
+            return error.PythonException;
+        } else if (inst.type_obj == PyClass_Type) {
+            const class_obj = inst.as(PyClassObject);
+            if (std.mem.eql(u8, name, "__name__")) {
+                class_obj.name.incRef();
+                return class_obj.name;
+            }
+            if (try self.lookupClassAttribute(class_obj, name)) |val| {
+                return val;
+            }
+
+            return try self.returnAttributeError(inst, name);
         } else {
-            std.debug.print("TypeError: '{s}' object has no attributes\n", .{inst.type_obj.name});
-            return error.TypeError;
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "TypeError: You tried to access attributes on a '{s}' object, but it has none! (It's like asking a fish to climb a tree!)", .{inst.type_obj.name}) catch "TypeError: object has no attributes";
+            try self.raiseTypeError(msg);
+            return error.PythonException;
         }
     }
 
     pub fn storeAttribute(self: *VM, inst: *PyObject, name: []const u8, val: *PyObject) anyerror!void {
-        const key_str = try PyStringObject.create(name, self.mm);
-        defer key_str.decRef(self.mm);
+        const key_str = try self.mm.internString(name);
         
         if (inst.type_obj == PyInstance_Type) {
             const instance = inst.as(PyInstanceObject);
             const dict = instance.dict.as(PyDictObject);
             try dict.setItem(key_str, val, self.mm);
+        } else if (inst.type_obj == PyClass_Type) {
+            const class_obj = inst.as(PyClassObject);
+            const dict = class_obj.dict.as(PyDictObject);
+            try dict.setItem(key_str, val, self.mm);
         } else {
-            std.debug.print("TypeError: '{s}' object does not support attribute assignment\n", .{inst.type_obj.name});
+            std.debug.print("TypeError: You tried to assign an attribute to a '{s}' object, but it doesn't support that! (No stick-on pockets allowed here!)\n", .{inst.type_obj.name});
             return error.TypeError;
         }
     }
@@ -907,11 +994,19 @@ pub const VM = struct {
             const code_wrapper = func.code.as(PyCodeObjectWrapper);
             const func_code = code_wrapper.code;
             
-            if (args.len != func_code.argcount) {
-                std.debug.print("TypeError: expected {d} arguments, got {d}\n", .{func_code.argcount, args.len});
-                for (args) |arg| {
-                    arg.decRef(self.mm);
-                }
+            // Compute effective defaults count (lower 16 bits of MAKE_FUNCTION arg)
+            const pos_defaults_len = func.defaults.len & 0xFFFF;
+            const min_args = if (func_code.argcount > pos_defaults_len) func_code.argcount - pos_defaults_len else 0;
+            
+            // Check argument count — relax upper bound if function accepts *args
+            if (args.len < min_args) {
+                std.debug.print("TypeError: This function expected at least {d} arguments, but you only gave it {d}! (It's hungry for more data!)\n", .{min_args, args.len});
+                for (args) |arg| arg.decRef(self.mm);
+                return error.TypeError;
+            }
+            if (func_code.vararg_name == null and args.len > func_code.argcount) {
+                std.debug.print("TypeError: This function expected at most {d} arguments, but you overloaded it with {d}! (Too much info!)\n", .{func_code.argcount, args.len});
+                for (args) |arg| arg.decRef(self.mm);
                 return error.TypeError;
             }
             
@@ -923,8 +1018,28 @@ pub const VM = struct {
                 if (init_instance) |ii| ii.incRef();
                 errdefer child_frame.deinit(self.mm, self.allocator);
                 
-                for (args, 0..) |arg_val, arg_idx| {
-                    child_frame.fastlocals[arg_idx] = arg_val;
+                // Fill regular positional args
+                for (0..func_code.argcount) |idx| {
+                    if (idx < args.len) {
+                        child_frame.fastlocals[idx] = args[idx];
+                    } else {
+                        const def_idx = idx - (func_code.argcount - pos_defaults_len);
+                        const def_val = func.defaults[def_idx];
+                        def_val.incRef();
+                        child_frame.fastlocals[idx] = def_val;
+                    }
+                }
+                // Pack extra args into *args tuple if vararg present
+                if (func_code.vararg_name != null) {
+                    const vararg_idx = func_code.argcount;
+                    const extra_count = if (args.len > func_code.argcount) args.len - func_code.argcount else 0;
+                    const vararg_tuple = try PyTupleObject.create(extra_count, self.mm);
+                    const tup_items = vararg_tuple.items();
+                    for (0..extra_count) |i| {
+                        args[func_code.argcount + i].incRef();
+                        tup_items[i] = args[func_code.argcount + i];
+                    }
+                    child_frame.fastlocals[vararg_idx] = &vararg_tuple.base;
                 }
                 
                 const gen_obj = try function_mod.PyGeneratorObject.create(child_frame, self.mm);
@@ -934,9 +1049,7 @@ pub const VM = struct {
             }
 
             if (self.frame_count >= 64) {
-                for (args) |arg| {
-                    arg.decRef(self.mm);
-                }
+                for (args) |arg| arg.decRef(self.mm);
                 return error.StackOverflow;
             }
             
@@ -947,8 +1060,36 @@ pub const VM = struct {
             if (init_instance) |ii| ii.incRef();
             errdefer child_frame.deinit(self.mm, self.allocator);
             
-            for (args, 0..) |arg_val, arg_idx| {
-                child_frame.fastlocals[arg_idx] = arg_val;
+            // Fill regular positional args
+            for (0..func_code.argcount) |idx| {
+                if (idx < args.len) {
+                    child_frame.fastlocals[idx] = args[idx];
+                } else {
+                    const def_idx = idx - (func_code.argcount - pos_defaults_len);
+                    const def_val = func.defaults[def_idx];
+                    def_val.incRef();
+                    child_frame.fastlocals[idx] = def_val;
+                }
+            }
+            // Pack extra positional args into *args tuple if vararg is declared
+            if (func_code.vararg_name != null) {
+                const vararg_idx = func_code.argcount;
+                const extra_count = if (args.len > func_code.argcount) args.len - func_code.argcount else 0;
+                const vararg_tuple = try PyTupleObject.create(extra_count, self.mm);
+                if (extra_count > 0) {
+                    const tup_items = vararg_tuple.items();
+                    for (0..extra_count) |i| {
+                        args[func_code.argcount + i].incRef();
+                        tup_items[i] = args[func_code.argcount + i];
+                    }
+                }
+                child_frame.fastlocals[vararg_idx] = &vararg_tuple.base;
+            }
+            // If **kwargs is declared, set to empty dict (keyword routing not yet wired)
+            if (func_code.kwarg_name != null) {
+                const kwarg_idx = func_code.argcount + (if (func_code.vararg_name != null) @as(usize, 1) else 0) + func_code.kwonlycount;
+                const kwargs_dict = try PyDictObject.create(self.mm);
+                child_frame.fastlocals[kwarg_idx] = &kwargs_dict.base;
             }
             
             self.frames[self.frame_count] = child_frame;
@@ -986,7 +1127,7 @@ pub const VM = struct {
             try self.callObject(method.func, new_args, init_instance);
         } else if (callable.type_obj == PyTypeWrapper_Type) {
             const wrapper = callable.as(@import("../stdlib/builtins.zig").PyTypeWrapper);
-            if (std.mem.eql(u8, wrapper.type_ptr.name, "Exception") or std.mem.eql(u8, wrapper.type_ptr.name, "AssertionError")) {
+            if (!std.mem.eql(u8, wrapper.type_ptr.name, "object")) {
                 const msg = if (args.len > 0) args[0] else try PyStringObject.create("", self.mm);
                 const exc = try PyExceptionObject.create(wrapper.type_ptr, msg, self.mm);
                 if (args.len == 0) {
@@ -1018,12 +1159,24 @@ pub const VM = struct {
                 }
                 f.push(&inst.base);
             }
-        } else {
-            std.debug.print("TypeError: '{s}' object is not callable\n", .{callable.type_obj.name});
-            for (args) |arg| {
-                arg.decRef(self.mm);
+        } else if (callable.type_obj == &@import("../objects/class.zig").PyInstance_Type) {
+            const inst = callable.as(@import("../objects/class.zig").PyInstanceObject);
+            if (try self.lookupClassAttribute(inst.class_obj, "__call__")) |call_func| {
+                defer call_func.decRef(self.mm);
+                const bound_call = try PyMethodObject.create(callable, call_func, self.mm);
+                defer bound_call.base.decRef(self.mm);
+                try self.callObject(&bound_call.base, args, init_instance);
+            } else {
+                var buf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "TypeError: You tried to call a '{s}' object like a function, but it doesn't have a __call__ method! (It's not that kind of phone line!)", .{callable.type_obj.name}) catch "TypeError: object is not callable";
+                for (args) |arg| arg.decRef(self.mm);
+                try self.raiseTypeError(msg);
             }
-            return error.TypeError;
+        } else {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "TypeError: You tried to call a '{s}' object like a function! Only functions, methods, and classes can be called. (Did you put parentheses where they don't belong?)", .{callable.type_obj.name}) catch "TypeError: object is not callable";
+            for (args) |arg| arg.decRef(self.mm);
+            try self.raiseTypeError(msg);
         }
     }
 
@@ -1209,6 +1362,186 @@ pub const VM = struct {
         const repr_val = try exc.type_obj.tp_repr.?(exc, self.mm);
         defer repr_val.decRef(self.mm);
         try self.stdout_writer.print("{s}\n", .{repr_val.as(PyStringObject).value()});
+        if (self.diagnostic_mode != .none) {
+            try self.printDiagnostics(exc);
+        }
+        exc.decRef(self.mm);
+        return error.PythonException;
+    }
+
+    fn printDiagnostics(self: *VM, exc: *PyObject) !void {
+        const type_name = exc.type_obj.name;
+        const exc_obj = exc.as(exception_mod.PyExceptionObject);
+        const clean_msg = exc_obj.message.as(PyStringObject).value();
+
+        if (self.diagnostic_mode == .hinglish) {
+            try self.stdout_writer.print("\n--- BharatPython Enhanced Diagnostics ---\n", .{});
+            
+            var hinglish_msg: []const u8 = "Kuch aisi galti hui hai jiska exact reason nahi pata. (An unknown error occurred).";
+            var english_msg: []const u8 = "An unknown error occurred.";
+            var suggestion_msg: []const u8 = "";
+            
+            if (std.mem.eql(u8, type_name, "NameError")) {
+                hinglish_msg = "Bhai, yeh variable ya function kahan se laya? Pehle isko define toh kar le, ya phir typo check kar!";
+                english_msg = "Bro, where did this variable or function come from? Define it first, or check for typos!";
+                suggestion_msg = "Define the variable before using it, or fix the spelling.";
+            } else if (std.mem.eql(u8, type_name, "SyntaxError")) {
+                hinglish_msg = "Arre yaar! Code likhne mein syntax ki galti kar di. Shayad koi bracket ')' ya colon ':' lagana bhool gaye.";
+                english_msg = "Oops! You made a grammatical error in your code. Maybe you forgot a bracket ')' or a colon ':'.";
+                suggestion_msg = "Check for missing parentheses, colons, or quotes.";
+            } else if (std.mem.eql(u8, type_name, "TypeError")) {
+                hinglish_msg = "Bhai, oil aur pani mix nahi hote! Tum alag-alag data types (jaise string aur int) ko ek sath jod rahe ho.";
+                english_msg = "Bro, oil and water don't mix! You are trying to combine incompatible data types (like string and int).";
+                suggestion_msg = "Convert variables to the correct type (e.g., using str() or int()) before operating on them.";
+            } else if (std.mem.eql(u8, type_name, "ValueError")) {
+                hinglish_msg = "Data type toh theek hai, par value mein ghapla hai! Jaise 'abc' ko integer banane ki koshish.";
+                english_msg = "Data type is correct, but the value is fishy! Like trying to turn 'abc' into an integer.";
+                suggestion_msg = "Ensure the value you are passing is valid for the operation.";
+            } else if (std.mem.eql(u8, type_name, "ImportError")) {
+                hinglish_msg = "Jo module tum import karna chahte ho uske andar yeh function nahi mila. Sahi function ka naam daalo.";
+                english_msg = "The module you are importing from doesn't have this function. Check the function name.";
+                suggestion_msg = "Verify the function name inside the module you are importing from.";
+            } else if (std.mem.eql(u8, type_name, "ModuleNotFoundError")) {
+                hinglish_msg = "Lagta hai yeh package tumhare computer mein hai hi nahi! Pehle 'pip install' kar lo bhai.";
+                english_msg = "Looks like this package doesn't exist on your computer! Do a 'pip install' first bro.";
+                suggestion_msg = "Run 'pip install <package_name>' in your terminal.";
+            } else if (std.mem.eql(u8, type_name, "KeyError")) {
+                hinglish_msg = "Dictionary mein yeh chabi (key) mila hi nahi! Dusre dictionary mein toh nahi dhund rahe?";
+                english_msg = "This key was not found in the dictionary! Are you looking in the wrong dictionary?";
+                suggestion_msg = "Check if the key exists using 'key in dict' or use 'dict.get(key)'.";
+            } else if (std.mem.eql(u8, type_name, "IndexError")) {
+                hinglish_msg = "List ke aukaat ke bahar ja rahe ho! Jitne items hain list mein, usse bada index daal diya.";
+                english_msg = "You're going out of the list's bounds! You provided an index larger than the list size.";
+                suggestion_msg = "Remember that lists start at index 0. Make sure your index is less than len(list).";
+            } else if (std.mem.eql(u8, type_name, "RuntimeError")) {
+                hinglish_msg = "Code chalte-chalte raaste mein accident ho gaya! Kuch unexpected hua hai.";
+                english_msg = "The code had an accident while running! Something unexpected happened.";
+                suggestion_msg = "Check the exact error message and your logic.";
+            } else if (std.mem.eql(u8, type_name, "AttributeError")) {
+                hinglish_msg = "Is object ke paas yeh superpower (attribute/method) nahi hai jo tum use karna chahte ho.";
+                english_msg = "This object doesn't have the superpower (attribute/method) you are trying to use.";
+                suggestion_msg = "Check the object's type and see if you misspelled the method name.";
+            } else if (std.mem.eql(u8, type_name, "FileNotFoundError")) {
+                hinglish_msg = "File ghayab hai boss! Ya toh file wahan hai hi nahi, ya path galat diya hai.";
+                english_msg = "The file is missing boss! Either the file doesn't exist there, or the path is wrong.";
+                suggestion_msg = "Check the file path and make sure the file exists.";
+            } else if (std.mem.eql(u8, type_name, "ZeroDivisionError")) {
+                hinglish_msg = "Maths ke niyam tod rahe ho! Kisi bhi number ko zero se divide karna paap hai.";
+                english_msg = "You're breaking the rules of Math! Dividing any number by zero is a sin.";
+                suggestion_msg = "Ensure the denominator is not zero before dividing.";
+            } else if (std.mem.eql(u8, type_name, "MemoryError")) {
+                hinglish_msg = "RAM full ho gayi hai bhai! Bahut zyada data ek sath load karne ki koshish mat karo.";
+                english_msg = "Your RAM is full bro! Don't try to load too much data all at once.";
+                suggestion_msg = "Process data in smaller chunks or optimize your memory usage.";
+            } else if (std.mem.eql(u8, type_name, "RecursionError")) {
+                hinglish_msg = "Tumhara function khud ko itni baar bula raha hai ki Python thak gaya (Infinite loop alert!).";
+                english_msg = "Your function is calling itself so many times that Python got tired (Infinite loop alert!).";
+                suggestion_msg = "Add a proper base case to your recursive function to make it stop.";
+            } else if (std.mem.eql(u8, type_name, "IndentationError")) {
+                hinglish_msg = "Arre yaar! Code ke blocks mein spacing (indentation) ka lafda hai. Tabs aur spaces check karo, ya sahi spaces daalo.";
+                english_msg = "Oops! There is a spacing (indentation) issue in your code blocks. Check tabs and spaces, or ensure consistent spacing.";
+                suggestion_msg = "Ensure all lines in the same block have the same amount of indentation (usually 4 spaces).";
+            } else if (std.mem.eql(u8, type_name, "AssertionError")) {
+                hinglish_msg = "Bhai, jo check (assert) tumne lagaya tha, woh fail ho gaya. Conditions match nahi kar rahi hain.";
+                english_msg = "Bro, the check (assertion) you set up has failed. The condition did not evaluate to True.";
+                suggestion_msg = "Double check the value being asserted and verify your assumptions.";
+            } else if (std.mem.eql(u8, type_name, "UnboundLocalError")) {
+                hinglish_msg = "Bhai, local variable ko pehle value dene se pehle hi use kar rahe ho. global ya nonlocal keyword use karo agar zaroorat ho.";
+                english_msg = "Bro, you are referencing a local variable before assigning a value to it. Use global or nonlocal if needed.";
+                suggestion_msg = "Assign a value to the variable in the local scope, or declare it global/nonlocal.";
+            } else if (std.mem.eql(u8, type_name, "PermissionError")) {
+                hinglish_msg = "Access denied boss! Is file ya folder ko padhne ya likhne ki permission nahi hai tumhare paas.";
+                english_msg = "Access denied boss! You don't have permission to read or write this file or folder.";
+                suggestion_msg = "Check the file permissions or run the script with administrator/superuser privileges.";
+            }
+            
+            try self.stdout_writer.print("Explanation: {s}\n", .{hinglish_msg});
+            try self.stdout_writer.print("English: {s}\n", .{english_msg});
+            if (suggestion_msg.len > 0) {
+                try self.stdout_writer.print("Suggestion: {s}\n", .{suggestion_msg});
+            }
+        } else if (self.diagnostic_mode == .jugaad) {
+            var title: []const u8 = "💥 Gadbad Ho Gayi";
+            var body: []const u8 = clean_msg;
+            
+            if (std.mem.eql(u8, type_name, "SyntaxError")) {
+                title = "🤦 Bhai kya likh diya?";
+                body = "Keyboard strike par hai kya? Code check karo.";
+            } else if (std.mem.eql(u8, type_name, "NameError")) {
+                title = "🕵️ Variable dhundte dhundte thak gaya.";
+                body = "Possible reasons:\n  • Typo kiya hai\n  • Variable declare karna bhool gaye\n  • Universe collapse ho gaya";
+            } else if (std.mem.eql(u8, type_name, "ZeroDivisionError")) {
+                title = "💀 Zero se divide?";
+                body = "Newton bhi confuse ho gaya. Maths seekh lo thoda.";
+            } else if (std.mem.eql(u8, type_name, "TypeError")) {
+                title = "🤔 Type mismatch ho gaya.";
+                body = "Galat data-type use kiya hai. Computation shock me chala gaya.";
+            } else if (std.mem.eql(u8, type_name, "IndexError")) {
+                title = "📭 List mein itna nahi hai!";
+                body = "List ke bahar chala gaya! Itna bada index kahan se mila?";
+            } else if (std.mem.eql(u8, type_name, "KeyError")) {
+                title = "🔑 Key gayab hai!";
+                body = "Dictionary mein ye key to hai hi nahi. Dhyan se check karo.";
+            } else if (std.mem.eql(u8, type_name, "AttributeError")) {
+                title = "🚫 Attribute mila hi nahi.";
+                body = "Object me ye feature/method nahi hai boss.";
+            } else if (std.mem.eql(u8, type_name, "ModuleNotFoundError")) {
+                title = "📦 Module missing!";
+                body = "Dhundne se bhi nahi mila. Install kiya hai kya? (jug install check karo)";
+            } else if (std.mem.eql(u8, type_name, "ValueError")) {
+                title = "🎭 Value galat hai boss!";
+                body = "Function ko sahi value do na. Ye kya bhej diya?";
+            } else if (std.mem.eql(u8, type_name, "ImportError")) {
+                title = "📥 Import gadbad ho gaya.";
+                body = "Kuch laane mein problem hai. Module ka naam check karo.";
+            } else if (std.mem.eql(u8, type_name, "FileNotFoundError")) {
+                title = "📁 File mili hi nahi!";
+                body = "Jagah sahi hai? File gayab ho gayi? Check karo path.";
+            } else if (std.mem.eql(u8, type_name, "PermissionError")) {
+                title = "🚫 Ijjazat nahi hai!";
+                body = "Permission nahi mili. Root bano ya sudo lagao.";
+            } else if (std.mem.eql(u8, type_name, "TimeoutError")) {
+                title = "⏰ Time khatam ho gaya!";
+                body = "Kaafi wait kar liya. Kuch gadbad hai operation mein.";
+            } else if (std.mem.eql(u8, type_name, "ConnectionError")) {
+                title = "🔌 Connection nahi ho raha!";
+                body = "Internet band hai ya server so gaya. Dobara try karo.";
+            } else if (std.mem.eql(u8, type_name, "RecursionError")) {
+                title = "🔄 Loop mein phans gaye!";
+                body = "Recursion itni deep aa gayi ki stack ka dhakkan khul gaya. Base case daalo.";
+            } else if (std.mem.eql(u8, type_name, "StopIteration")) {
+                title = "🏁 Iterator khatam ho gaya.";
+                body = "Aur kuch nahi bacha. Next call mat karo ab.";
+            } else if (std.mem.eql(u8, type_name, "MemoryError")) {
+                title = "🧠 Yaad kam pad gayi.";
+                body = "RAM ka saath nahi de rahi. Kuch band karo ya RAM badhao.";
+            } else if (std.mem.eql(u8, type_name, "OverflowError")) {
+                title = "📈 Hadd se zyada ho gaya!";
+                body = "Number itna bada ki calculator bhi haar gaya.";
+            } else if (std.mem.eql(u8, type_name, "FloatingPointError")) {
+                title = "🎯 Point mein gadbad.";
+                body = "Floating point ki precision ne dhoka de diya. Round karke dekho.";
+            } else if (std.mem.eql(u8, type_name, "EOFError")) {
+                title = "📄 File achanak khatam!";
+                body = "Padhte padhte end aa gaya. Aur kuch data nahi hai.";
+            } else if (std.mem.eql(u8, type_name, "UnicodeError")) {
+                title = "🔤 Unicode samajh nahi aaya.";
+                body = "Characters encoding ki problem. UTF-8 try karo.";
+            } else if (std.mem.eql(u8, type_name, "KeyboardInterrupt")) {
+                title = "⌨️ Ctrl+C! Kaunsi shakti hai ye?";
+                body = "Achha choro, aadha kaam theek hai. Agli baar file se chalao.";
+            } else if (std.mem.eql(u8, type_name, "AssertionError")) {
+                title = "🎯 Assert ka pakka fail!";
+                body = "Na maanne wali baat galat nikli. Dhyan se check karo.";
+            } else if (std.mem.eql(u8, type_name, "NotImplementedError")) {
+                title = "🏗️ Abhi baki hai!";
+                body = "Ye feature abhi implement nahi hua. Khud likhdo.";
+            }
+            
+            try self.stdout_writer.print("{s}\n", .{title});
+            try self.stdout_writer.print("\nKya gadbad hai?\n  {s}\n", .{body});
+            try self.stdout_writer.print("\nOriginal System Error: {s}: {s}\n", .{type_name, clean_msg});
+        }
         exc.decRef(self.mm);
         return error.PythonException;
     }
@@ -1222,7 +1555,21 @@ pub const VM = struct {
         self.frames[self.frame_count] = PyFrameObject.init(self.allocator, code, globals_ptr, true);
         self.frame_count += 1;
 
-        try self.runLoop(starting_frame_count);
+        var current_starting_frame = starting_frame_count;
+        while (true) {
+            self.runLoop(current_starting_frame) catch |err| {
+                if (err == error.PythonException) {
+                    return error.PythonException;
+                }
+                try self.raiseZigError(err);
+                if (self.frame_count > starting_frame_count) {
+                    current_starting_frame = self.frame_count - 1;
+                    continue;
+                }
+                return error.PythonException;
+            };
+            break;
+        }
         return self.last_result.?;
     }
 
@@ -1328,13 +1675,35 @@ pub const VM = struct {
                     if (found_obj == null) {
                         found_obj = globals.get(name);
                     }
+                    if (found_obj == null and globals != &self.globals) {
+                        found_obj = self.globals.get(name);
+                    }
                     
                     if (found_obj) |obj| {
                         obj.incRef();
                         push(f, &stack_top, obj);
                     } else {
-                        std.debug.print("NameError: name '{s}' is not defined\n", .{name});
-                        return error.NameError;
+                        f.ip = ip;
+                        f.stack_top = stack_top;
+                        
+                        var buf: [256]u8 = undefined;
+                        const msg = std.fmt.bufPrint(&buf, "NameError: I looked everywhere, but I couldn't find '{s}'. Did you forget to define it or spell it wrong? (Maybe it's hiding behind the couch?)", .{name}) catch "NameError: undefined name";
+                        try self.raiseNameError(msg);
+                        
+                        frame_idx = self.frame_count - 1;
+                        f = &self.frames[frame_idx];
+                        ip = f.ip;
+                        stack_top = f.stack_top;
+                        instructions = f.code.instructions;
+                        consts = f.code.consts;
+                        names = f.code.names;
+                        varnames = f.code.varnames;
+                        fastlocals = f.fastlocals;
+                        globals = f.globals;
+                        locals = &f.locals;
+                        is_module = f.is_module;
+                        is_class_body = f.is_class_body;
+                        func = f.func;
                     }
                 },
                 .BINARY_ADD => {
@@ -1446,11 +1815,28 @@ pub const VM = struct {
                     } else {
                         defer a.decRef(self.mm);
                         defer b.decRef(self.mm);
+                        const op: CompareOp = @enumFromInt(instr.arg);
                         if (a.type_obj.tp_richcompare) |cmp_fn| {
-                            const res = try cmp_fn(a, b, @enumFromInt(instr.arg), self.mm);
+                            const res = try cmp_fn(a, b, op, self.mm);
+                            push(f, &stack_top, res);
+                        } else if (b.type_obj.tp_richcompare) |cmp_fn| {
+                            const res = try cmp_fn(b, a, swapOp(op), self.mm);
                             push(f, &stack_top, res);
                         } else {
-                            return error.TypeError;
+                            if (op == .Eq or op == .Ne) {
+                                var is_same = (a == b);
+                                if (!is_same and a.type_obj == PyTypeWrapper_Type and b.type_obj == PyTypeWrapper_Type) {
+                                    const wrapper_a = a.as(@import("../stdlib/builtins.zig").PyTypeWrapper);
+                                    const wrapper_b = b.as(@import("../stdlib/builtins.zig").PyTypeWrapper);
+                                    is_same = (wrapper_a.type_ptr == wrapper_b.type_ptr);
+                                }
+                                const match = if (op == .Eq) is_same else !is_same;
+                                const res = if (match) PyTrue else PyFalse;
+                                res.incRef();
+                                push(f, &stack_top, res);
+                            } else {
+                                return error.TypeError;
+                            }
                         }
                     }
                 },
@@ -1621,7 +2007,22 @@ pub const VM = struct {
                     const code_obj = pop(f, &stack_top);
                     defer code_obj.decRef(self.mm);
                     
-                    const func_obj = try PyFunctionObject.create(code_obj, globals, self.mm);
+                    const num_defaults = instr.arg;
+                    var defaults = try self.allocator.alloc(*PyObject, num_defaults);
+                    defer self.allocator.free(defaults);
+                    var def_i: usize = num_defaults;
+                    while (def_i > 0) {
+                        def_i -= 1;
+                        defaults[def_i] = pop(f, &stack_top);
+                    }
+                    
+                    defer {
+                        for (defaults) |d| {
+                            d.decRef(self.mm);
+                        }
+                    }
+                    
+                    const func_obj = try PyFunctionObject.create(code_obj, globals, defaults, self.mm);
                     errdefer func_obj.base.decRef(self.mm);
                     
                     const code_wrapper = code_obj.as(PyCodeObjectWrapper);
@@ -1784,7 +2185,29 @@ pub const VM = struct {
                     const inst = pop(f, &stack_top);
                     defer inst.decRef(self.mm);
                     const name = names[instr.arg];
-                    const attr = try self.loadAttribute(inst, name);
+                    f.ip = ip;
+                    f.stack_top = stack_top;
+                    const attr = self.loadAttribute(inst, name) catch |err| {
+                        if (err == error.PythonException) {
+                            if (self.frame_count == 0) return error.PythonException;
+                            frame_idx = self.frame_count - 1;
+                            f = &self.frames[frame_idx];
+                            ip = f.ip;
+                            stack_top = f.stack_top;
+                            instructions = f.code.instructions;
+                            consts = f.code.consts;
+                            names = f.code.names;
+                            varnames = f.code.varnames;
+                            fastlocals = f.fastlocals;
+                            globals = f.globals;
+                            locals = &f.locals;
+                            is_module = f.is_module;
+                            is_class_body = f.is_class_body;
+                            func = f.func;
+                            continue;
+                        }
+                        return err;
+                    };
                     push(f, &stack_top, attr);
                 },
                 .STORE_ATTR => {
@@ -1793,13 +2216,57 @@ pub const VM = struct {
                     const val = pop(f, &stack_top);
                     defer val.decRef(self.mm);
                     const name = names[instr.arg];
-                    try self.storeAttribute(inst, name, val);
+                    f.ip = ip;
+                    f.stack_top = stack_top;
+                    self.storeAttribute(inst, name, val) catch |err| {
+                        if (err == error.PythonException) {
+                            if (self.frame_count == 0) return error.PythonException;
+                            frame_idx = self.frame_count - 1;
+                            f = &self.frames[frame_idx];
+                            ip = f.ip;
+                            stack_top = f.stack_top;
+                            instructions = f.code.instructions;
+                            consts = f.code.consts;
+                            names = f.code.names;
+                            varnames = f.code.varnames;
+                            fastlocals = f.fastlocals;
+                            globals = f.globals;
+                            locals = &f.locals;
+                            is_module = f.is_module;
+                            is_class_body = f.is_class_body;
+                            func = f.func;
+                            continue;
+                        }
+                        return err;
+                    };
                 },
                 .LOAD_METHOD => {
                     const inst = pop(f, &stack_top);
                     defer inst.decRef(self.mm);
                     const name = names[instr.arg];
-                    const attr = try self.loadAttribute(inst, name);
+                    f.ip = ip;
+                    f.stack_top = stack_top;
+                    const attr = self.loadAttribute(inst, name) catch |err| {
+                        if (err == error.PythonException) {
+                            if (self.frame_count == 0) return error.PythonException;
+                            frame_idx = self.frame_count - 1;
+                            f = &self.frames[frame_idx];
+                            ip = f.ip;
+                            stack_top = f.stack_top;
+                            instructions = f.code.instructions;
+                            consts = f.code.consts;
+                            names = f.code.names;
+                            varnames = f.code.varnames;
+                            fastlocals = f.fastlocals;
+                            globals = f.globals;
+                            locals = &f.locals;
+                            is_module = f.is_module;
+                            is_class_body = f.is_class_body;
+                            func = f.func;
+                            continue;
+                        }
+                        return err;
+                    };
                     push(f, &stack_top, attr);
                 },
                 .CALL_METHOD => {
@@ -1934,8 +2401,27 @@ pub const VM = struct {
                         cv.incRef();
                         push(f, &stack_top, cv);
                     } else {
-                        std.debug.print("NameError: free variable '{s}' referenced before assignment in enclosing scope\n", .{name});
-                        return error.NameError;
+                        f.ip = ip;
+                        f.stack_top = stack_top;
+                        
+                        var buf: [256]u8 = undefined;
+                        const msg = std.fmt.bufPrint(&buf, "NameError: You tried to use the free variable '{s}' before defining it! (It's free, but not that free!)", .{name}) catch "NameError: undefined free variable";
+                        try self.raiseNameError(msg);
+                        
+                        frame_idx = self.frame_count - 1;
+                        f = &self.frames[frame_idx];
+                        ip = f.ip;
+                        stack_top = f.stack_top;
+                        instructions = f.code.instructions;
+                        consts = f.code.consts;
+                        names = f.code.names;
+                        varnames = f.code.varnames;
+                        fastlocals = f.fastlocals;
+                        globals = f.globals;
+                        locals = &f.locals;
+                        is_module = f.is_module;
+                        is_class_body = f.is_class_body;
+                        func = f.func;
                     }
                 },
                 .STORE_DEREF => {
@@ -1996,8 +2482,27 @@ pub const VM = struct {
                         push(f, &stack_top, val);
                     } else {
                         const name = varnames[idx];
-                        std.debug.print("NameError: local variable '{s}' referenced before assignment\n", .{name});
-                        return error.NameError;
+                        f.ip = ip;
+                        f.stack_top = stack_top;
+                        
+                        var buf: [256]u8 = undefined;
+                        const msg = std.fmt.bufPrint(&buf, "NameError: You tried to read the local variable '{s}' before giving it a value! (That's like looking for water in an empty cup!)", .{name}) catch "NameError: undefined local variable";
+                        try self.raiseNameError(msg);
+                        
+                        frame_idx = self.frame_count - 1;
+                        f = &self.frames[frame_idx];
+                        ip = f.ip;
+                        stack_top = f.stack_top;
+                        instructions = f.code.instructions;
+                        consts = f.code.consts;
+                        names = f.code.names;
+                        varnames = f.code.varnames;
+                        fastlocals = f.fastlocals;
+                        globals = f.globals;
+                        locals = &f.locals;
+                        is_module = f.is_module;
+                        is_class_body = f.is_class_body;
+                        func = f.func;
                     }
                 },
                 .STORE_FAST => {
@@ -2165,7 +2670,7 @@ pub const VM = struct {
                     } else if (iterable.type_obj == PyInstance_Type) {
                         // User-defined instance — try __iter__ protocol
                         const iter_method = self.loadAttribute(iterable, "__iter__") catch {
-                            std.debug.print("TypeError: '{s}' object is not iterable\n", .{iterable.as(PyInstanceObject).class_obj.name.as(PyStringObject).value()});
+                            std.debug.print("TypeError: You tried to loop over a '{s}' object, but it isn't iterable! (It doesn't know how to line up its elements!)\n", .{iterable.as(PyInstanceObject).class_obj.name.as(PyStringObject).value()});
                             return error.TypeError;
                         };
                         defer iter_method.decRef(self.mm);
@@ -2454,6 +2959,18 @@ pub const VM = struct {
                         const val = ba_obj.items.?[uidx];
                         const int_obj = try primitives.PyIntObject.create(val, self.mm);
                         push(f, &stack_top, int_obj);
+                    } else if (container.type_obj == &@import("../objects/class.zig").PyInstance_Type) {
+                        const instance = container.as(@import("../objects/class.zig").PyInstanceObject);
+                        if (try self.lookupClassAttribute(instance.class_obj, "__getitem__")) |getitem_func| {
+                            defer getitem_func.decRef(self.mm);
+                            const bound = try PyMethodObject.create(&instance.base, getitem_func, self.mm);
+                            defer bound.base.decRef(self.mm);
+                            var call_args = [_]*PyObject{index};
+                            const res = try self.callCallable(&bound.base, &call_args);
+                            push(f, &stack_top, res);
+                        } else {
+                            return error.TypeError;
+                        }
                     } else {
                         return error.TypeError;
                     }
@@ -2497,6 +3014,18 @@ pub const VM = struct {
                             return error.ValueError;
                         }
                         ba_obj.items.?[uidx] = @intCast(val);
+                    } else if (container.type_obj == &@import("../objects/class.zig").PyInstance_Type) {
+                        const instance = container.as(@import("../objects/class.zig").PyInstanceObject);
+                        if (try self.lookupClassAttribute(instance.class_obj, "__setitem__")) |setitem_func| {
+                            defer setitem_func.decRef(self.mm);
+                            const bound = try PyMethodObject.create(&instance.base, setitem_func, self.mm);
+                            defer bound.base.decRef(self.mm);
+                            var call_args = [_]*PyObject{index, value};
+                            const res = try self.callCallable(&bound.base, &call_args);
+                            res.decRef(self.mm);
+                        } else {
+                            return error.TypeError;
+                        }
                     } else {
                         return error.TypeError;
                     }
@@ -2539,6 +3068,18 @@ pub const VM = struct {
                             list.items.?[j] = list.items.?[j + 1];
                         }
                         list.size -= 1;
+                    } else if (container.type_obj == &@import("../objects/class.zig").PyInstance_Type) {
+                        const instance = container.as(@import("../objects/class.zig").PyInstanceObject);
+                        if (try self.lookupClassAttribute(instance.class_obj, "__delitem__")) |delitem_func| {
+                            defer delitem_func.decRef(self.mm);
+                            const bound = try PyMethodObject.create(&instance.base, delitem_func, self.mm);
+                            defer bound.base.decRef(self.mm);
+                            var call_args = [_]*PyObject{index};
+                            const res = try self.callCallable(&bound.base, &call_args);
+                            res.decRef(self.mm);
+                        } else {
+                            return error.TypeError;
+                        }
                     } else {
                         return error.TypeError;
                     }
@@ -2547,8 +3088,7 @@ pub const VM = struct {
                     const obj = pop(f, &stack_top);
                     defer obj.decRef(self.mm);
                     const name = names[instr.arg];
-                    const key_str = try PyStringObject.create(name, self.mm);
-                    defer key_str.decRef(self.mm);
+                    const key_str = try self.mm.internString(name);
                     
                     if (obj.type_obj == PyInstance_Type) {
                         const instance = obj.as(PyInstanceObject);
@@ -2563,7 +3103,27 @@ pub const VM = struct {
                     const a = pop(f, &stack_top);
                     defer a.decRef(self.mm);
                     defer b.decRef(self.mm);
-                    const is_same = (a == b);
+                    var is_same = (a == b);
+                    if (!is_same) {
+                        const builtins = @import("../stdlib/builtins.zig");
+                        if (a.type_obj == PyTypeWrapper_Type and b.type_obj == PyTypeWrapper_Type) {
+                            const wrapper_a = a.as(builtins.PyTypeWrapper);
+                            const wrapper_b = b.as(builtins.PyTypeWrapper);
+                            is_same = (wrapper_a.type_ptr == wrapper_b.type_ptr);
+                        } else if (a.type_obj == PyTypeWrapper_Type and b.type_obj == PyBuiltinFunction_Type) {
+                            const wrapper_a = a.as(builtins.PyTypeWrapper);
+                            const func_b = b.as(PyBuiltinFunctionObject);
+                            if (builtins.matchBuiltinType(func_b.name)) |t_ptr| {
+                                is_same = (wrapper_a.type_ptr == t_ptr);
+                            }
+                        } else if (a.type_obj == PyBuiltinFunction_Type and b.type_obj == PyTypeWrapper_Type) {
+                            const func_a = a.as(PyBuiltinFunctionObject);
+                            const wrapper_b = b.as(builtins.PyTypeWrapper);
+                            if (builtins.matchBuiltinType(func_a.name)) |t_ptr| {
+                                is_same = (t_ptr == wrapper_b.type_ptr);
+                            }
+                        }
+                    }
                     const result = if (instr.arg == 0) is_same else !is_same;
                     const res = if (result) PyTrue else PyFalse;
                     res.incRef();
@@ -2688,7 +3248,7 @@ pub const VM = struct {
                         const val_a = a.as(primitives.PyIntObject).value;
                         const val_b = b.as(primitives.PyIntObject).value;
                         if (val_b < 0) {
-                            std.debug.print("ValueError: negative shift count\n", .{});
+                            std.debug.print("ValueError: You tried to shift bits by a negative count ({d})! (Shifting backwards in time is not yet supported in this dimension!)\n", .{val_b});
                             return error.ValueError;
                         }
                         const res_val = if (val_b >= 64) @as(i64, 0) else val_a << @intCast(val_b);
@@ -2708,7 +3268,7 @@ pub const VM = struct {
                         const val_a = a.as(primitives.PyIntObject).value;
                         const val_b = b.as(primitives.PyIntObject).value;
                         if (val_b < 0) {
-                            std.debug.print("ValueError: negative shift count\n", .{});
+                            std.debug.print("ValueError: You tried to shift bits by a negative count ({d})! (Shifting backwards in time is not yet supported in this dimension!)\n", .{val_b});
                             return error.ValueError;
                         }
                         const res_val = if (val_b >= 64) (if (val_a < 0) @as(i64, -1) else @as(i64, 0)) else val_a >> @intCast(val_b);
@@ -2845,6 +3405,328 @@ pub const VM = struct {
                     }
                     push(f, &stack_top, val);
                 },
+
+                // --- Phase 5 new opcodes ---
+                .UNPACK_SEQUENCE => {
+                    const count = instr.arg;
+                    const seq = pop(f, &stack_top);
+                    defer seq.decRef(self.mm);
+
+                    // Materialize iterable into a temporary items list
+                    var items_list = std.ArrayList(*PyObject).empty;
+                    defer {
+                        // Items that weren't pushed get decRef'd
+                        items_list.deinit(self.allocator);
+                    }
+
+                    if (seq.type_obj == PyList_Type) {
+                        const lst = seq.as(PyListObject);
+                        try items_list.ensureTotalCapacity(self.allocator, lst.size);
+                        for (0..lst.size) |i| {
+                            lst.items.?[i].incRef();
+                            try items_list.append(self.allocator, lst.items.?[i]);
+                        }
+                    } else if (seq.type_obj == PyTuple_Type) {
+                        const tup = seq.as(PyTupleObject);
+                        const tup_items = tup.items();
+                        try items_list.ensureTotalCapacity(self.allocator, tup_items.len);
+                        for (tup_items) |item| {
+                            item.incRef();
+                            try items_list.append(self.allocator, item);
+                        }
+                    } else if (seq.type_obj == PyString_Type) {
+                        const str_val = seq.as(PyStringObject).value();
+                        try items_list.ensureTotalCapacity(self.allocator, str_val.len);
+                        for (str_val, 0..) |_, i| {
+                            const ch = try PyStringObject.create(str_val[i..i+1], self.mm);
+                            try items_list.append(self.allocator, ch);
+                        }
+                    } else {
+                        f.ip = ip;
+                        f.stack_top = stack_top;
+                        
+                        var buf: [256]u8 = undefined;
+                        const msg = std.fmt.bufPrint(&buf, "TypeError: You tried to unpack a '{s}' object which isn't a list, tuple, or string! (You can't unpack a single object like a present without wrapping it first!)", .{seq.type_obj.name}) catch "TypeError: cannot unpack non-sequence";
+                        try self.raiseTypeError(msg);
+                        
+                        if (self.frame_count == 0) return error.PythonException;
+                        frame_idx = self.frame_count - 1;
+                        f = &self.frames[frame_idx];
+                        ip = f.ip;
+                        stack_top = f.stack_top;
+                        instructions = f.code.instructions;
+                        consts = f.code.consts;
+                        names = f.code.names;
+                        varnames = f.code.varnames;
+                        fastlocals = f.fastlocals;
+                        globals = f.globals;
+                        locals = &f.locals;
+                        is_module = f.is_module;
+                        is_class_body = f.is_class_body;
+                        func = f.func;
+                        continue;
+                    }
+
+                    if (items_list.items.len != count) {
+                        f.ip = ip;
+                        f.stack_top = stack_top;
+                        
+                        var buf: [512]u8 = undefined;
+                        const msg = if (items_list.items.len < count)
+                            std.fmt.bufPrint(&buf, "ValueError: You tried to unpack {d} values, but only got {d}! (You can't get two shoes out of one box!)", .{count, items_list.items.len}) catch "ValueError: not enough values to unpack"
+                        else
+                            std.fmt.bufPrint(&buf, "ValueError: You tried to unpack {d} values, but there's too much stuff in here ({d} items)! (It's like trying to fit a sleeping bag back into its original pouch!)", .{count, items_list.items.len}) catch "ValueError: too many values to unpack";
+                        
+                        try self.raiseValueError(msg);
+                        for (items_list.items) |item| item.decRef(self.mm);
+                        
+                        if (self.frame_count == 0) return error.PythonException;
+                        frame_idx = self.frame_count - 1;
+                        f = &self.frames[frame_idx];
+                        ip = f.ip;
+                        stack_top = f.stack_top;
+                        instructions = f.code.instructions;
+                        consts = f.code.consts;
+                        names = f.code.names;
+                        varnames = f.code.varnames;
+                        fastlocals = f.fastlocals;
+                        globals = f.globals;
+                        locals = &f.locals;
+                        is_module = f.is_module;
+                        is_class_body = f.is_class_body;
+                        func = f.func;
+                        continue;
+                    }
+
+                    // Push in reverse so TOS = first item
+                    var ri: usize = count;
+                    while (ri > 0) {
+                        ri -= 1;
+                        push(f, &stack_top, items_list.items[ri]);
+                    }
+                    // Clear the list without decRef (items were transferred to stack)
+                    items_list.clearRetainingCapacity();
+                },
+
+                .CALL_EX => {
+                    // arg=0: TOS=args_tuple, TOS1=callable
+                    // arg=1: TOS=kwargs_dict, TOS1=args_tuple, TOS2=callable
+                    const has_kwargs = instr.arg != 0;
+                    const kwargs_obj: ?*PyObject = if (has_kwargs) pop(f, &stack_top) else null;
+                    defer if (kwargs_obj) |k| k.decRef(self.mm);
+                    const args_obj = pop(f, &stack_top);
+                    defer args_obj.decRef(self.mm);
+                    const callable = pop(f, &stack_top);
+                    defer callable.decRef(self.mm);
+
+                    // Convert args_obj (tuple or list) to a slice
+                    var args_slice: []*PyObject = undefined;
+                    var args_backing: std.ArrayList(*PyObject) = std.ArrayList(*PyObject).empty;
+                    defer args_backing.deinit(self.allocator);
+
+                    if (args_obj.type_obj == PyList_Type) {
+                        const lst = args_obj.as(PyListObject);
+                        try args_backing.ensureTotalCapacity(self.allocator, lst.size);
+                        for (0..lst.size) |i| {
+                            lst.items.?[i].incRef();
+                            try args_backing.append(self.allocator, lst.items.?[i]);
+                        }
+                        args_slice = args_backing.items;
+                    } else if (args_obj.type_obj == PyTuple_Type) {
+                        const tup = args_obj.as(PyTupleObject);
+                        const tup_items = tup.items();
+                        try args_backing.ensureTotalCapacity(self.allocator, tup_items.len);
+                        for (tup_items) |item| {
+                            item.incRef();
+                            try args_backing.append(self.allocator, item);
+                        }
+                        args_slice = args_backing.items;
+                    } else {
+                        std.debug.print("TypeError: You tried to use '*' on a non-iterable argument! The argument after '*' must be a list, tuple, or string. (I can't spread a single value for you!)\n", .{});
+                        return error.TypeError;
+                    }
+
+                    // If kwargs, merge keyword args from dict into fastlocals later
+                    // For now: just call with positional args
+                    f.ip = ip;
+                    f.stack_top = stack_top;
+                    try self.callObject(callable, args_slice, null);
+                    for (args_slice) |a| a.decRef(self.mm);
+
+                    frame_idx = self.frame_count - 1;
+                    f = &self.frames[frame_idx];
+                    ip = f.ip;
+                    stack_top = f.stack_top;
+                    instructions = f.code.instructions;
+                    consts = f.code.consts;
+                    names = f.code.names;
+                    varnames = f.code.varnames;
+                    fastlocals = f.fastlocals;
+                    globals = f.globals;
+                    locals = &f.locals;
+                    is_module = f.is_module;
+                    is_class_body = f.is_class_body;
+                    func = f.func;
+                },
+
+                .LIST_EXTEND => {
+                    // TOS = iterable to extend with, TOS[arg] = list to extend
+                    const iterable = pop(f, &stack_top);
+                    defer iterable.decRef(self.mm);
+                    const list_obj = f.stack[stack_top - 1 - instr.arg];
+                    if (list_obj.type_obj != PyList_Type) return error.TypeError;
+                    const list = list_obj.as(PyListObject);
+                    
+                    if (iterable.type_obj == PyList_Type) {
+                        const src = iterable.as(PyListObject);
+                        for (0..src.size) |idx| {
+                            src.items.?[idx].incRef();
+                            try list.append(src.items.?[idx], self.mm);
+                        }
+                    } else if (iterable.type_obj == PyTuple_Type) {
+                        const tup = iterable.as(PyTupleObject);
+                        for (tup.items()) |item| {
+                            item.incRef();
+                            try list.append(item, self.mm);
+                        }
+                    } else if (iterable.type_obj == PyString_Type) {
+                        const str_val = iterable.as(PyStringObject).value();
+                        for (str_val, 0..) |_, idx| {
+                            const ch = try PyStringObject.create(str_val[idx..idx+1], self.mm);
+                            try list.append(ch, self.mm);
+                            ch.decRef(self.mm);
+                        }
+                    } else {
+                        std.debug.print("TypeError: You tried to unpack a non-iterable using '*' inside a list/tuple literal! (I can't extend this list without something to loop over!)\n", .{});
+                        return error.TypeError;
+                    }
+                },
+
+                .DICT_MERGE => {
+                    // TOS = dict to merge from, TOS[arg] = dict to merge into
+                    const src = pop(f, &stack_top);
+                    defer src.decRef(self.mm);
+                    const dst_obj = f.stack[stack_top - 1 - instr.arg];
+                    if (dst_obj.type_obj != PyDict_Type) return error.TypeError;
+                    if (src.type_obj != PyDict_Type) return error.TypeError;
+                    const dst = dst_obj.as(PyDictObject);
+                    const src_dict = src.as(PyDictObject);
+                    var idx: usize = 0;
+                    while (idx < src_dict.entries_size) : (idx += 1) {
+                        const entry = &src_dict.entries[idx];
+                        if (entry.key) |k| {
+                            try dst.setItem(k, entry.value.?, self.mm);
+                        }
+                    }
+                },
+
+                .STORE_SUBSCR_AUG, .STORE_ATTR_AUG => {
+                    // These are unused (augmented assign is lowered to load+op+store)
+                    // Treat as no-ops for safety
+                },
+                .SWAP => {
+                    const temp = f.stack[stack_top - 1];
+                    f.stack[stack_top - 1] = f.stack[stack_top - 2];
+                    f.stack[stack_top - 2] = temp;
+                },
+            }
+        }
+    }
+
+    pub fn raiseExceptionType(self: *VM, exc_type: *const PyTypeObject, msg: []const u8) anyerror!void {
+        const msg_obj = try PyStringObject.create(msg, self.mm);
+        const exc = try PyExceptionObject.create(exc_type, msg_obj, self.mm);
+        msg_obj.decRef(self.mm);
+        defer exc.base.decRef(self.mm);
+        try self.raiseException(&exc.base);
+    }
+
+    pub fn raiseTypeError(self: *VM, msg: []const u8) anyerror!void {
+        try self.raiseExceptionType(&exception_mod.PyTypeError_Type, msg);
+    }
+
+    pub fn raiseNameError(self: *VM, msg: []const u8) anyerror!void {
+        try self.raiseExceptionType(&exception_mod.PyNameError_Type, msg);
+    }
+
+    pub fn raiseValueError(self: *VM, msg: []const u8) anyerror!void {
+        try self.raiseExceptionType(&exception_mod.PyValueError_Type, msg);
+    }
+
+    pub fn raiseAttributeError(self: *VM, msg: []const u8) anyerror!void {
+        try self.raiseExceptionType(&exception_mod.PyAttributeError_Type, msg);
+    }
+
+    pub fn raiseZeroDivisionError(self: *VM, msg: []const u8) anyerror!void {
+        try self.raiseExceptionType(&exception_mod.PyZeroDivisionError_Type, msg);
+    }
+
+    pub fn raiseKeyError(self: *VM, msg: []const u8) anyerror!void {
+        try self.raiseExceptionType(&exception_mod.PyKeyError_Type, msg);
+    }
+
+    pub fn raiseIndexError(self: *VM, msg: []const u8) anyerror!void {
+        try self.raiseExceptionType(&exception_mod.PyIndexError_Type, msg);
+    }
+
+    pub fn raiseAssertionError(self: *VM, msg: []const u8) anyerror!void {
+        try self.raiseExceptionType(&exception_mod.PyAssertionError_Type, msg);
+    }
+
+    pub fn raiseRuntimeError(self: *VM, msg: []const u8) anyerror!void {
+        try self.raiseExceptionType(&exception_mod.PyRuntimeError_Type, msg);
+    }
+
+    pub fn raiseImportError(self: *VM, msg: []const u8) anyerror!void {
+        try self.raiseExceptionType(&exception_mod.PyImportError_Type, msg);
+    }
+
+    pub fn raiseModuleNotFoundError(self: *VM, msg: []const u8) anyerror!void {
+        try self.raiseExceptionType(&exception_mod.PyModuleNotFoundError_Type, msg);
+    }
+
+    pub fn raiseFileNotFoundError(self: *VM, msg: []const u8) anyerror!void {
+        try self.raiseExceptionType(&exception_mod.PyFileNotFoundError_Type, msg);
+    }
+
+    pub fn raisePermissionError(self: *VM, msg: []const u8) anyerror!void {
+        try self.raiseExceptionType(&exception_mod.PyPermissionError_Type, msg);
+    }
+
+    pub fn raiseMemoryError(self: *VM, msg: []const u8) anyerror!void {
+        try self.raiseExceptionType(&exception_mod.PyMemoryError_Type, msg);
+    }
+
+    pub fn raiseRecursionError(self: *VM, msg: []const u8) anyerror!void {
+        try self.raiseExceptionType(&exception_mod.PyRecursionError_Type, msg);
+    }
+
+    pub fn raiseIndentationError(self: *VM, msg: []const u8) anyerror!void {
+        try self.raiseExceptionType(&exception_mod.PyIndentationError_Type, msg);
+    }
+
+    pub fn raiseUnboundLocalError(self: *VM, msg: []const u8) anyerror!void {
+        try self.raiseExceptionType(&exception_mod.PyUnboundLocalError_Type, msg);
+    }
+
+    pub fn raiseZigError(self: *VM, err: anyerror) anyerror!void {
+        switch (err) {
+            error.ZeroDivisionError => try self.raiseZeroDivisionError("ZeroDivisionError: division by zero"),
+            error.TypeError => try self.raiseTypeError("TypeError: incompatible types or invalid operation"),
+            error.ValueError => try self.raiseValueError("ValueError: invalid value"),
+            error.KeyError => try self.raiseKeyError("KeyError: key not found"),
+            error.IndexError => try self.raiseIndexError("IndexError: index out of range"),
+            error.AttributeError => try self.raiseAttributeError("AttributeError: attribute not found"),
+            error.FileNotFoundError => try self.raiseFileNotFoundError("FileNotFoundError: file not found"),
+            error.PermissionError => try self.raisePermissionError("PermissionError: permission denied"),
+            error.MemoryError => try self.raiseMemoryError("MemoryError: out of memory"),
+            error.RecursionError => try self.raiseRecursionError("RecursionError: maximum recursion depth exceeded"),
+            error.IndentationError => try self.raiseIndentationError("IndentationError: bad indentation"),
+            error.AssertionError => try self.raiseAssertionError("AssertionError: assertion failed"),
+            else => {
+                var buf: [128]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "RuntimeError: execution error: {s}", .{@errorName(err)}) catch "RuntimeError: execution error";
+                try self.raiseRuntimeError(msg);
             }
         }
     }
@@ -2876,8 +3758,9 @@ pub const VM = struct {
             const code_wrapper = func.code.as(PyCodeObjectWrapper);
             const func_code = code_wrapper.code;
             
-            if (args.len != func_code.argcount) {
-                std.debug.print("TypeError: expected {d} arguments, got {d}\n", .{func_code.argcount, args.len});
+            const min_args = func_code.argcount - func.defaults.len;
+            if (args.len < min_args or args.len > func_code.argcount) {
+                std.debug.print("TypeError: expected {d} to {d} arguments, got {d}\n", .{min_args, func_code.argcount, args.len});
                 return error.TypeError;
             }
             
@@ -2887,9 +3770,17 @@ pub const VM = struct {
             child_frame.func = func;
             func.base.incRef();
             
-            for (args, 0..) |arg_val, arg_idx| {
-                arg_val.incRef();
-                child_frame.fastlocals[arg_idx] = arg_val;
+            for (0..func_code.argcount) |idx| {
+                if (idx < args.len) {
+                    const arg_val = args[idx];
+                    arg_val.incRef();
+                    child_frame.fastlocals[idx] = arg_val;
+                } else {
+                    const def_idx = idx - (func_code.argcount - func.defaults.len);
+                    const def_val = func.defaults[def_idx];
+                    def_val.incRef();
+                    child_frame.fastlocals[idx] = def_val;
+                }
             }
             
             const starting_frame_count = self.frame_count;
@@ -2903,6 +3794,15 @@ pub const VM = struct {
             try self.runLoop(starting_frame_count);
             
             return self.last_result orelse PyNone;
+        } else if (callable.type_obj == PyMethod_Type) {
+            const method = callable.as(PyMethodObject);
+            var new_args = try self.allocator.alloc(*PyObject, args.len + 1);
+            defer self.allocator.free(new_args);
+            new_args[0] = method.self_obj;
+            for (args, 0..) |arg, idx| {
+                new_args[idx + 1] = arg;
+            }
+            return try self.callCallable(method.func, new_args);
         } else {
             return error.TypeError;
         }
