@@ -56,6 +56,11 @@ pub const Comprehension = struct {
     ifs: []AST,         // filter conditions
 };
 
+pub const KeywordArg = struct {
+    name: []const u8,
+    value: AST,
+};
+
 pub const AST = union(enum) {
     Module: struct {
         body: []AST,
@@ -167,6 +172,7 @@ pub const AST = union(enum) {
     Call: struct {
         func: *AST,
         args: []AST,
+        keywords: []KeywordArg = &[_]KeywordArg{}, // kw=arg explicit keyword args
         starargs: ?*AST = null,  // *expr positional spread
         kwargs: ?*AST = null,    // **expr keyword spread
     },

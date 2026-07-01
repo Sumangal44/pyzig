@@ -83,6 +83,10 @@ pub const Opcode = enum(u8) {
     STORE_SUBSCR_AUG,      // for d[k] op= v  (load + op + store in one sequence)
     STORE_ATTR_AUG,        // for obj.attr op= v
     SWAP,                  // swaps TOS and TOS1
+    CALL_KW,               // call with kwargs, TOS is tuple of kw names
+    BUILD_TUPLE_UNPACK,    // pop arg iterables, build tuple
+    BUILD_LIST_UNPACK,     // pop arg iterables, build list
+    BUILD_SET_UNPACK,      // pop arg iterables, build set
 };
 
 pub const Instruction = struct {

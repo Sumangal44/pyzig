@@ -1179,11 +1179,11 @@ pub fn builtinFilter(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObjec
         var is_ok = false;
         
         if (callable == PyNone) {
-            is_ok = @import("../vm/vm.zig").isTrue(item);
+            is_ok = try vm.isTrueObj(item);
         } else {
             var call_args = [_]*PyObject{item};
             const res = try vm.callCallable(callable, &call_args);
-            is_ok = @import("../vm/vm.zig").isTrue(res);
+            is_ok = try vm.isTrueObj(res);
             res.decRef(vm.mm);
         }
         
@@ -1266,7 +1266,7 @@ pub fn builtinAny(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
     
     for (0..orig_list.size) |i| {
         const item = orig_list.items.?[i];
-        if (@import("../vm/vm.zig").isTrue(item)) {
+        if (try vm.isTrueObj(item)) {
             PyTrue.incRef();
             return PyTrue;
         }
@@ -1690,7 +1690,7 @@ pub fn builtinAll(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
     
     for (0..orig_list.size) |i| {
         const item = orig_list.items.?[i];
-        if (!@import("../vm/vm.zig").isTrue(item)) {
+        if (!(try vm.isTrueObj(item))) {
             PyFalse.incRef();
             return PyFalse;
         }
@@ -2538,6 +2538,22 @@ pub fn builtinProperty(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObj
 
     const prop = try PyPropertyObject.create(fget, fset, fdel, doc, vm.mm);
     return &prop.base;
+}
+
+pub fn builtinClassmethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 1) return error.TypeError;
+    const func = args[0];
+    return try @import("../objects/classmethod.zig").PyClassMethodObject.create(func, vm.mm);
+}
+
+pub fn builtinStaticmethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len != 1) return error.TypeError;
+    const func = args[0];
+    return try @import("../objects/staticmethod.zig").PyStaticMethodObject.create(func, vm.mm);
 }
 
 pub fn bytearrayAppendMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
@@ -3390,4 +3406,49 @@ pub fn stringSplitlinesMethod(args: []*PyObject, vm_opaque: *anyopaque) anyerror
         try list.append(last_line, vm.mm);
     }
     return &list.base;
+}
+
+pub fn builtinEval(args: []*PyObject, vm_opaque: *anyopaque) anyerror!*PyObject {
+    const VM = @import("../vm/vm.zig").VM;
+    const vm: *VM = @ptrCast(@alignCast(vm_opaque));
+    if (args.len < 1 or args.len > 3) return error.TypeError;
+    
+    const src_obj = args[0];
+    if (src_obj.type_obj != PyString_Type) return error.TypeError;
+    const src = src_obj.as(PyStringObject).value();
+    
+    var globals: ?*std.StringHashMap(*PyObject) = null;
+    if (args.len >= 2 and args[1].type_obj == PyDict_Type) {
+        // Fallback to current globals
+        globals = vm.frames[vm.frame_count - 1].globals;
+    } else {
+        globals = vm.frames[vm.frame_count - 1].globals;
+    }
+    
+    var temp_arena = std.heap.ArenaAllocator.init(vm.allocator);
+    defer temp_arena.deinit();
+    const temp_alloc = temp_arena.allocator();
+    
+    var lexer = @import("../lexer/lexer.zig").Lexer.init(src);
+    var p = @import("../parser/parser.zig").Parser.init(&lexer, temp_alloc);
+    // don't defer p.deinit(), it uses temp_alloc
+    
+    var expr_ast = p.parseExpression() catch |err| {
+        try vm.stdout_writer.print("SyntaxError in eval: {any}\n", .{err});
+        return error.SyntaxError;
+    };
+    
+    const Compiler = @import("../compiler/compiler.zig").Compiler;
+    var compiler = Compiler.init(temp_alloc, vm.mm);
+    // compiler uses temp_alloc, so deinit is optional but good practice
+    defer compiler.deinit();
+    
+    var code = compiler.compileExpr(&expr_ast) catch |err| {
+        try vm.stdout_writer.print("CompilerError in eval: {any}\n", .{err});
+        return error.SyntaxError;
+    };
+    // code uses temp_alloc, so it lives until temp_arena.deinit()
+    
+    const res = try vm.run(&code, globals);
+    return res;
 }

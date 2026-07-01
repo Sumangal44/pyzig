@@ -228,6 +228,15 @@ pub const Compiler = struct {
                 for (call.args) |*arg| {
                     try self.preScanExpr(arg);
                 }
+                for (call.keywords) |*kw| {
+                    try self.preScanExpr(&kw.value);
+                }
+                if (call.starargs) |sa| {
+                    try self.preScanExpr(sa);
+                }
+                if (call.kwargs) |kw| {
+                    try self.preScanExpr(kw);
+                }
             },
             .List => |lst| {
                 for (lst.elts) |*elt| {
@@ -689,16 +698,72 @@ pub const Compiler = struct {
                 try self.instructions.append(self.allocator, .{ .op = .JUMP_BACKWARD, .arg = @intCast(loop_start) });
             },
             .List => |list_node| {
+                var has_starred = false;
                 for (list_node.elts) |*elt| {
-                    try self.compileAST(elt);
+                    if (elt.* == .Starred) has_starred = true;
                 }
-                try self.instructions.append(self.allocator, .{ .op = .BUILD_LIST, .arg = @intCast(list_node.elts.len) });
+                if (has_starred) {
+                    var iterables_count: usize = 0;
+                    var current_chunk_size: usize = 0;
+                    for (list_node.elts) |*elt| {
+                        if (elt.* == .Starred) {
+                            if (current_chunk_size > 0) {
+                                try self.instructions.append(self.allocator, .{ .op = .BUILD_LIST, .arg = @intCast(current_chunk_size) });
+                                iterables_count += 1;
+                                current_chunk_size = 0;
+                            }
+                            try self.compileAST(elt.*.Starred.value);
+                            iterables_count += 1;
+                        } else {
+                            try self.compileAST(elt);
+                            current_chunk_size += 1;
+                        }
+                    }
+                    if (current_chunk_size > 0) {
+                        try self.instructions.append(self.allocator, .{ .op = .BUILD_LIST, .arg = @intCast(current_chunk_size) });
+                        iterables_count += 1;
+                    }
+                    try self.instructions.append(self.allocator, .{ .op = .BUILD_LIST_UNPACK, .arg = @intCast(iterables_count) });
+                } else {
+                    for (list_node.elts) |*elt| {
+                        try self.compileAST(elt);
+                    }
+                    try self.instructions.append(self.allocator, .{ .op = .BUILD_LIST, .arg = @intCast(list_node.elts.len) });
+                }
             },
             .Tuple => |tuple_node| {
+                var has_starred = false;
                 for (tuple_node.elts) |*elt| {
-                    try self.compileAST(elt);
+                    if (elt.* == .Starred) has_starred = true;
                 }
-                try self.instructions.append(self.allocator, .{ .op = .BUILD_TUPLE, .arg = @intCast(tuple_node.elts.len) });
+                if (has_starred) {
+                    var iterables_count: usize = 0;
+                    var current_chunk_size: usize = 0;
+                    for (tuple_node.elts) |*elt| {
+                        if (elt.* == .Starred) {
+                            if (current_chunk_size > 0) {
+                                try self.instructions.append(self.allocator, .{ .op = .BUILD_TUPLE, .arg = @intCast(current_chunk_size) });
+                                iterables_count += 1;
+                                current_chunk_size = 0;
+                            }
+                            try self.compileAST(elt.*.Starred.value);
+                            iterables_count += 1;
+                        } else {
+                            try self.compileAST(elt);
+                            current_chunk_size += 1;
+                        }
+                    }
+                    if (current_chunk_size > 0) {
+                        try self.instructions.append(self.allocator, .{ .op = .BUILD_TUPLE, .arg = @intCast(current_chunk_size) });
+                        iterables_count += 1;
+                    }
+                    try self.instructions.append(self.allocator, .{ .op = .BUILD_TUPLE_UNPACK, .arg = @intCast(iterables_count) });
+                } else {
+                    for (tuple_node.elts) |*elt| {
+                        try self.compileAST(elt);
+                    }
+                    try self.instructions.append(self.allocator, .{ .op = .BUILD_TUPLE, .arg = @intCast(tuple_node.elts.len) });
+                }
             },
             .Dict => |dict_node| {
                 for (dict_node.keys, 0..) |*key, i| {
@@ -708,10 +773,38 @@ pub const Compiler = struct {
                 try self.instructions.append(self.allocator, .{ .op = .BUILD_MAP, .arg = @intCast(dict_node.keys.len) });
             },
             .Set => |set_node| {
+                var has_starred = false;
                 for (set_node.elts) |*elt| {
-                    try self.compileAST(elt);
+                    if (elt.* == .Starred) has_starred = true;
                 }
-                try self.instructions.append(self.allocator, .{ .op = .BUILD_SET, .arg = @intCast(set_node.elts.len) });
+                if (has_starred) {
+                    var iterables_count: usize = 0;
+                    var current_chunk_size: usize = 0;
+                    for (set_node.elts) |*elt| {
+                        if (elt.* == .Starred) {
+                            if (current_chunk_size > 0) {
+                                try self.instructions.append(self.allocator, .{ .op = .BUILD_SET, .arg = @intCast(current_chunk_size) });
+                                iterables_count += 1;
+                                current_chunk_size = 0;
+                            }
+                            try self.compileAST(elt.*.Starred.value);
+                            iterables_count += 1;
+                        } else {
+                            try self.compileAST(elt);
+                            current_chunk_size += 1;
+                        }
+                    }
+                    if (current_chunk_size > 0) {
+                        try self.instructions.append(self.allocator, .{ .op = .BUILD_SET, .arg = @intCast(current_chunk_size) });
+                        iterables_count += 1;
+                    }
+                    try self.instructions.append(self.allocator, .{ .op = .BUILD_SET_UNPACK, .arg = @intCast(iterables_count) });
+                } else {
+                    for (set_node.elts) |*elt| {
+                        try self.compileAST(elt);
+                    }
+                    try self.instructions.append(self.allocator, .{ .op = .BUILD_SET, .arg = @intCast(set_node.elts.len) });
+                }
             },
             .FunctionDef => |func_def| {
                 // Compile decorators first (top-to-bottom)
@@ -870,49 +963,62 @@ pub const Compiler = struct {
             .Call => |call_node| {
                 try self.compileAST(call_node.func);
 
-                // Separate keyword args from positional
-                var pos_args_count: usize = 0;
-                var kw_count: usize = 0;
-                for (call_node.args) |*arg| {
-                    if (arg.* == .Keyword) {
-                        kw_count += 1;
-                    } else {
+                if (call_node.starargs != null or call_node.kwargs != null) {
+                    // CALL_EX path: build args tuple from stack, merge with *starargs, then call
+                    // First, evaluate all positional and keyword arguments
+                    var pos_args_count: usize = 0;
+                    for (call_node.args) |*arg| {
                         pos_args_count += 1;
                         try self.compileAST(arg);
                     }
-                }
-                // Then compile keyword args
-                for (call_node.args) |*arg| {
-                    if (arg.* == .Keyword) {
-                        try self.compileAST(arg);
-                    }
-                }
-
-                if (call_node.starargs != null or call_node.kwargs != null) {
-                    // CALL_EX path: build args tuple from stack, merge with *starargs, then call
-                    // Build a tuple from positional args
                     try self.instructions.append(self.allocator, .{ .op = .BUILD_TUPLE, .arg = @intCast(pos_args_count) });
                     if (call_node.starargs) |sa| {
-                        // extend with *args: LIST_EXTEND
-                        try self.instructions.append(self.allocator, .{ .op = .LIST_EXTEND, .arg = 0 }); // TOS=starargs, TOS1=tuple
-                        _ = sa; // sa is already compiled above indirectly? No — we need to compile it
-                        // Actually: compile starargs, then merge into tuple
-                        // Let's redo: compile starargs before BUILD_TUPLE
-                        // This is complex — use simpler approach: concat tuples
-                        try self.compileAST(call_node.starargs.?);
+                        try self.compileAST(sa);
                         try self.instructions.append(self.allocator, .{ .op = .BINARY_ADD }); // tuple + starargs
                     }
-                    const has_kwargs: u16 = if (call_node.kwargs != null) 1 else 0;
-                    if (call_node.kwargs) |kw| {
-                        try self.compileAST(kw);
+                    
+                    const has_kwargs: u16 = if (call_node.kwargs != null or call_node.keywords.len > 0) 1 else 0;
+                    if (has_kwargs == 1) {
+                        // We must build a kwargs dict. Let's just use BUILD_MAP and dict merge
+                        try self.instructions.append(self.allocator, .{ .op = .BUILD_MAP, .arg = 0 });
+                        // Add explicit keywords
+                        for (call_node.keywords) |*kw| {
+                            const kw_str = try self.addConst(try @import("../objects/primitives.zig").PyStringObject.create(kw.name, self.mm));
+                            try self.instructions.append(self.allocator, .{ .op = .LOAD_CONST, .arg = kw_str });
+                            try self.compileAST(&kw.value);
+                            // Set item on dict. We can use STORE_SUBSCR_AUG or similar?
+                            // For simplicity, let's just let DICT_MERGE handle everything by building small dicts and merging
+                            try self.instructions.append(self.allocator, .{ .op = .BUILD_MAP, .arg = 1 });
+                            try self.instructions.append(self.allocator, .{ .op = .DICT_MERGE, .arg = 1 }); // merge into the main dict below it
+                        }
+                        if (call_node.kwargs) |kw| {
+                            try self.compileAST(kw);
+                            try self.instructions.append(self.allocator, .{ .op = .DICT_MERGE, .arg = 1 });
+                        }
                     }
                     try self.instructions.append(self.allocator, .{ .op = .CALL_EX, .arg = has_kwargs });
-                } else if (kw_count > 0) {
-                    // Has keyword args but no spread: emit CALL with keyword args encoded
-                    // For simplicity, pass all (positional + keyword) — VM will handle keyword routing
-                    try self.instructions.append(self.allocator, .{ .op = .CALL, .arg = @intCast(pos_args_count + kw_count) });
+                } else if (call_node.keywords.len > 0) {
+                    // Has keyword args but no spread: emit CALL_KW with keyword args encoded
+                    // push all positional args
+                    for (call_node.args) |*arg| {
+                        try self.compileAST(arg);
+                    }
+                    // push all keyword args
+                    const kw_tuple = try @import("../objects/collections.zig").PyTupleObject.create(call_node.keywords.len, self.mm);
+                    for (call_node.keywords, 0..) |*kw, i| {
+                        try self.compileAST(&kw.value);
+                        kw_tuple.items()[i] = try @import("../objects/primitives.zig").PyStringObject.create(kw.name, self.mm);
+                    }
+                    // create a tuple of keyword names and push as const
+                    const kw_const_idx = try self.addConst(&kw_tuple.base);
+                    try self.instructions.append(self.allocator, .{ .op = .LOAD_CONST, .arg = kw_const_idx });
+                    
+                    try self.instructions.append(self.allocator, .{ .op = .CALL_KW, .arg = @intCast(call_node.args.len + call_node.keywords.len) });
                 } else {
-                    try self.instructions.append(self.allocator, .{ .op = .CALL, .arg = @intCast(pos_args_count) });
+                    for (call_node.args) |*arg| {
+                        try self.compileAST(arg);
+                    }
+                    try self.instructions.append(self.allocator, .{ .op = .CALL, .arg = @intCast(call_node.args.len) });
                 }
             },
             .Expr => |expr_node| {
@@ -1910,6 +2016,21 @@ pub const Compiler = struct {
             .instructions = try self.instructions.toOwnedSlice(self.allocator),
             .consts = try self.consts.toOwnedSlice(self.allocator),
             .names = try self.names.toOwnedSlice(self.allocator),
+            .varnames = try self.varnames.toOwnedSlice(self.allocator),
+        };
+    }
+
+    pub fn compileExpr(self: *Compiler, node: *const AST) anyerror!PyCodeObject {
+        try self.compileAST(node);
+
+        // Return the value left on the stack by the expression
+        try self.instructions.append(self.allocator, .{ .op = .RETURN_VALUE });
+
+        return PyCodeObject{
+            .instructions = try self.instructions.toOwnedSlice(self.allocator),
+            .consts = try self.consts.toOwnedSlice(self.allocator),
+            .names = try self.names.toOwnedSlice(self.allocator),
+            .varnames = try self.varnames.toOwnedSlice(self.allocator),
         };
     }
 };

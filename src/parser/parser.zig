@@ -10,6 +10,7 @@ const CompareOp = @import("../ast/ast.zig").CompareOp;
 const ExceptHandler = @import("../ast/ast.zig").ExceptHandler;
 const WithItem = @import("../ast/ast.zig").WithItem;
 const Comprehension = @import("../ast/ast.zig").Comprehension;
+const KeywordArg = @import("../ast/ast.zig").KeywordArg;
 
 pub const Parser = struct {
     lexer: *Lexer,
@@ -662,7 +663,7 @@ pub const Parser = struct {
         return AST{ .Expr = .{ .value = try self.builder.newAST(expr) } };
     }
 
-    fn parseExpression(self: *Parser) anyerror!AST {
+    pub fn parseExpression(self: *Parser) anyerror!AST {
         // NamedExpr (walrus): identifier := value
         if (self.peekType() == .identifier and self.peekNextType() == .colon_equal) {
             const name = try self.builder.allocator.dupe(u8, self.current_token.lexeme);
@@ -1044,9 +1045,16 @@ pub const Parser = struct {
 
         // List literal or comprehension: [1, 2, 3] or [x for x in items]
         if (self.match(.lbracket)) {
-            const first = try self.parseExpression();
+            var first: AST = undefined;
+            if (self.match(.star)) {
+                const expr = try self.parseExpression();
+                first = AST{ .Starred = .{ .value = try self.builder.newAST(expr) } };
+            } else {
+                first = try self.parseExpression();
+            }
             // Check for list comprehension: [expr for ...]
             if (self.peekType() == .kw_for) {
+                if (first == .Starred) return error.ParseError; // No *x in comprehensions
                 const generators = try self.parseComprehensionGenerators();
                 try self.consume(.rbracket, "Expect ']' after list comprehension");
                 return AST{ .ListComp = .{
@@ -1054,14 +1062,20 @@ pub const Parser = struct {
                     .generators = generators,
                 } };
             }
-            var elts = std.ArrayList(AST).empty;
+            var elts = std.ArrayListUnmanaged(AST).empty;
             errdefer elts.deinit(self.builder.allocator);
             try elts.append(self.builder.allocator, first);
             while (self.peekType() != .rbracket) {
                 if (self.peekType() == .comma) {
                     self.advance();
                     if (self.peekType() == .rbracket) break;
-                    const elt = try self.parseExpression();
+                    var elt: AST = undefined;
+                    if (self.match(.star)) {
+                        const expr = try self.parseExpression();
+                        elt = AST{ .Starred = .{ .value = try self.builder.newAST(expr) } };
+                    } else {
+                        elt = try self.parseExpression();
+                    }
                     try elts.append(self.builder.allocator, elt);
                 } else {
                     std.debug.print("parseBase (list): unexpected token '{s}' ({s}) at line {d}, col {d}\n", .{self.current_token.lexeme, @tagName(self.peekType()), self.current_token.line, self.current_token.column});
@@ -1077,9 +1091,16 @@ pub const Parser = struct {
             if (self.match(.rparen)) {
                 return AST{ .Tuple = .{ .elts = &[_]AST{} } };
             }
-            const first = try self.parseExpression();
+            var first: AST = undefined;
+            if (self.match(.star)) {
+                const expr = try self.parseExpression();
+                first = AST{ .Starred = .{ .value = try self.builder.newAST(expr) } };
+            } else {
+                first = try self.parseExpression();
+            }
             // Check for generator expression: (expr for ...)
             if (self.peekType() == .kw_for) {
+                if (first == .Starred) return error.ParseError;
                 const generators = try self.parseComprehensionGenerators();
                 try self.consume(.rparen, "Expect ')' after generator expression");
                 return AST{ .GeneratorExp = .{
@@ -1088,11 +1109,17 @@ pub const Parser = struct {
                 } };
             }
             if (self.match(.comma)) {
-                var elts = std.ArrayList(AST).empty;
+                var elts = std.ArrayListUnmanaged(AST).empty;
                 errdefer elts.deinit(self.builder.allocator);
                 try elts.append(self.builder.allocator, first);
                 while (self.peekType() != .rparen) {
-                    const elt = try self.parseExpression();
+                    var elt: AST = undefined;
+                    if (self.match(.star)) {
+                        const expr = try self.parseExpression();
+                        elt = AST{ .Starred = .{ .value = try self.builder.newAST(expr) } };
+                    } else {
+                        elt = try self.parseExpression();
+                    }
                     try elts.append(self.builder.allocator, elt);
                     if (self.peekType() == .comma) {
                         self.advance();
@@ -1275,8 +1302,10 @@ pub const Parser = struct {
         
         while (true) {
             if (self.match(.lparen)) {
-                var args = std.ArrayList(AST).empty;
+                var args = std.ArrayListUnmanaged(AST).empty;
                 errdefer args.deinit(self.builder.allocator);
+                var keywords = std.ArrayListUnmanaged(KeywordArg).empty;
+                errdefer keywords.deinit(self.builder.allocator);
                 var starargs: ?*AST = null;
                 var kwargs: ?*AST = null;
                 while (self.peekType() != .rparen) {
@@ -1291,11 +1320,10 @@ pub const Parser = struct {
                             // This is a keyword argument
                             self.advance(); // consume '='
                             const val = try self.parseExpression();
-                            const kw_node = AST{ .Keyword = .{
+                            try keywords.append(self.builder.allocator, .{
                                 .name = try self.builder.allocator.dupe(u8, kw_name),
-                                .value = try self.builder.newAST(val),
-                            } };
-                            try args.append(self.builder.allocator, kw_node);
+                                .value = val,
+                            });
                         } else {
                             // Not a keyword arg — restore and parse as normal expression
                             self.lexer.restore(saved_lexer);
@@ -1328,6 +1356,7 @@ pub const Parser = struct {
                 expr = AST{ .Call = .{
                     .func = try self.builder.newAST(expr),
                     .args = try args.toOwnedSlice(self.builder.allocator),
+                    .keywords = try keywords.toOwnedSlice(self.builder.allocator),
                     .starargs = starargs,
                     .kwargs = kwargs,
                 } };

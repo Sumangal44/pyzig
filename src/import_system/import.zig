@@ -623,10 +623,12 @@ pub fn importModule(name: []const u8, vm: *VM) anyerror!*PyObject {
                     const command = args[0].as(PyStringObject).value();
                     
                     const argv = [_][]const u8{ "/bin/sh", "-c", command };
-                    var child = std.process.Child.init(&argv, vm2.allocator);
-                    const term = child.spawnAndWait() catch return error.OSError;
-                    const exit_code = switch (term) {
-                        .Exited => |code| code,
+                    var child = try std.process.spawn(vm2.io, .{
+                        .argv = &argv,
+                    });
+                    const term = try child.wait(vm2.io);
+                    const exit_code: i64 = switch (term) {
+                        .exited => |code| code,
                         else => -1,
                     };
                     return try @import("../objects/primitives.zig").PyIntObject.create(@as(i64, @intCast(exit_code)), vm2.mm);
